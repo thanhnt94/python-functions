@@ -1,38 +1,28 @@
-# interactive_scanner.py
+# Elements/interactive_scanner.py
 import logging
 import time
 import tkinter as tk
-
-import comtypes
-import comtypes.client
-import win32con
-import win32gui
-import win32process
 from ctypes import wintypes
 
-# --- Cài đặt các thư viện cần thiết ---
+# --- Thư viện cần thiết ---
 try:
+    import win32gui
+    import comtypes
+    import comtypes.client
     import keyboard
-except ImportError:
-    print("Vui lòng cài thư viện keyboard: pip install keyboard")
+except ImportError as e:
+    print(f"Lỗi import thư viện, vui lòng cài đặt: {e}")
     exit()
-try:
-    from pywinauto import Desktop
-except ImportError:
-    print("Vui lòng cài thư viện pywinauto: pip install pywinauto")
-    exit()
-try:
-    import psutil
-except ImportError:
-    print("Vui lòng cài thư viện psutil: pip install psutil")
-    exit()
+
+# --- Import từ các module tùy chỉnh ---
+from ui_core import get_element_details_comprehensive, get_window_details, format_dict_as_pep8_string
+
 try:
     # noinspection PyUnresolvedReferences
     from comtypes.gen import UIAutomationClient as UIA
 except (ImportError, ModuleNotFoundError):
     logging.error("Không tìm thấy thư viện comtypes.gen.UIAutomationClient.")
     UIA = None
-
 
 def setup_logging():
     """Cấu hình logging để ghi ra cả console và file."""
@@ -45,22 +35,13 @@ def setup_logging():
     console_handler.setFormatter(logging.Formatter(log_format))
     logging.getLogger('').addHandler(console_handler)
 
-
-def format_and_print_dict(title, data_dict):
-    """Định dạng và in một dictionary theo kiểu PEP 8."""
+def print_formatted_dict(title, data_dict):
+    """In một dictionary đã được định dạng ra console."""
     header = f" {title} "
     line_len = 80
     print("\n" + header.center(line_len, "="))
-
-    if not data_dict:
-        print("{}")
-    else:
-        print("{")
-        for key, value in sorted(data_dict.items()):
-            print(f"    {repr(key)}: {repr(value)},")
-        print("}")
+    print(format_dict_as_pep8_string(data_dict))
     print("=" * line_len + "\n")
-
 
 class InteractiveScanner:
     """Quét giao diện người dùng một cách tương tác."""
@@ -70,14 +51,12 @@ class InteractiveScanner:
             raise RuntimeError("UIAutomationClient không thể khởi tạo.")
 
         self.logger = logging.getLogger(self.__class__.__name__)
-        self.proc_info_cache = {}
         self.scan_requested = False
 
         self.logger.info("Khởi tạo InteractiveScanner...")
         try:
             self.uia = comtypes.client.CreateObject(UIA.CUIAutomation)
             self.tree_walker = self.uia.ControlViewWalker
-            self.desktop = Desktop(backend='uia')
         except (OSError, comtypes.COMError) as e:
             self.logger.critical(f"Lỗi nghiêm trọng khi khởi tạo COM: {e}", exc_info=True)
             raise
@@ -85,7 +64,7 @@ class InteractiveScanner:
 
     @staticmethod
     def _draw_highlight_rectangle(rect):
-        """Vẽ một hình chữ nhật tạm thời trên màn hình."""
+        """Vẽ một hình chữ nhật tạm thời trên màn hình để làm nổi bật element."""
         try:
             left, top, right, bottom = rect
             width = right - left
@@ -106,124 +85,62 @@ class InteractiveScanner:
             root.after(1500, root.destroy)
             root.mainloop()
         except Exception as e:
-            logging.getLogger("Highlight").error(f"Lỗi khi vẽ hình chữ nhật: {e}")
-
-    def _get_process_info(self, pid):
-        if pid in self.proc_info_cache:
-            return self.proc_info_cache[pid]
-        if pid > 0 and psutil:
-            try:
-                p = psutil.Process(pid)
-                info = {
-                    'proc_name': p.name(),
-                    'proc_path': p.exe(),
-                    'proc_cmdline': ' '.join(p.cmdline()),
-                    'proc_create_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p.create_time())),
-                    'proc_username': p.username()
-                }
-                self.proc_info_cache[pid] = info
-                return info
-            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                self.logger.warning(f"Không thể truy cập tiến trình PID={pid}: {e}")
-        return {}
-
-    def _get_window_details(self, hwnd):
-        self.logger.debug(f"Đang lấy thông tin chi tiết cho cửa sổ handle={hwnd}")
-        data = {}
-        try:
-            data['win32_handle'] = hwnd
-            data['pwa_title'] = win32gui.GetWindowText(hwnd)
-            data['pwa_class_name'] = win32gui.GetClassName(hwnd)
-            data['win32_styles'] = hex(win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE))
-            data['win32_extended_styles'] = hex(win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE))
-            rect = win32gui.GetWindowRect(hwnd)
-            data['geo_rectangle_tuple'] = (rect[0], rect[1], rect[2], rect[3])
-            
-            try:
-                win_element = self.desktop.window(handle=hwnd).element_info
-                data['pwa_auto_id'] = win_element.automation_id
-                if win_element.control_type:
-                    data['pwa_control_type'] = win_element.control_type.capitalize()
-                data['pwa_framework_id'] = win_element.framework_id
-            except Exception:
-                pass
-                
-            thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
-            data['proc_pid'] = pid
-            data.update(self._get_process_info(pid))
-        except Exception as e:
-            self.logger.error(f"Lỗi khi lấy thông tin cửa sổ handle={hwnd}: {e}", exc_info=True)
-        return data
-
-    def _get_element_details_comprehensive(self, element):
-        if not element:
-            return {}
-        data = {}
-        try:
-            pid = element.CurrentProcessId
-            data.update(self._get_process_info(pid))
-            data['proc_pid'] = pid
-            data['pwa_title'] = element.CurrentName
-            data['pwa_auto_id'] = element.CurrentAutomationId
-            
-            control_type_str = element.CurrentLocalizedControlType or element.CurrentControlType.name.replace('Control', '')
-            if control_type_str:
-                data['pwa_control_type'] = control_type_str.capitalize()
-            
-            data['pwa_class_name'] = element.CurrentClassName
-            
-            rect = element.CurrentBoundingRectangle
-            if rect:
-                data['geo_bounding_rect_tuple'] = (rect.left, rect.top, rect.right, rect.bottom)
-        except comtypes.COMError:
-            self.logger.warning(f"Lỗi COM khi truy cập element (Name: {data.get('pwa_title', 'N/A')}).")
-        except Exception as e:
-            self.logger.error(f"Lỗi không xác định khi lấy thông tin element: {e}", exc_info=True)
-        return data
+            logging.getLogger("Highlight").error(f"Lỗi khi vẽ hình chữ nhật: {e}", exc_info=True)
 
     def _request_scan(self):
+        """Ghi nhận yêu cầu quét từ phím nóng."""
         self.logger.info("Yêu cầu quét đã được ghi nhận từ F8.")
         self.scan_requested = True
 
     def run_scan_at_cursor(self):
+        """Thực hiện quét tại vị trí con trỏ chuột."""
         try:
             cursor_pos = win32gui.GetCursorPos()
             self.logger.info(f"Bắt đầu quét tại vị trí: {cursor_pos}")
 
-            try:
-                point = wintypes.POINT(cursor_pos[0], cursor_pos[1])
-                element = self.uia.ElementFromPoint(point)
-            except Exception as e:
-                self.logger.error(f"Lỗi nghiêm trọng khi gọi ElementFromPoint: {e}")
-                return
+            point = wintypes.POINT(cursor_pos[0], cursor_pos[1])
+            element = self.uia.ElementFromPoint(point)
 
             if not element:
                 self.logger.warning("Không tìm thấy element nào dưới con trỏ.")
                 return
 
-            element_details = self._get_element_details_comprehensive(element)
+            # SỬ DỤNG HÀM TỪ UI_CORE
+            element_details = get_element_details_comprehensive(element)
             
             coords = element_details.get('geo_bounding_rect_tuple')
             if coords:
                 self.logger.info(f"Đang vẽ hình chữ nhật tại tọa độ: {coords}")
                 self._draw_highlight_rectangle(coords)
 
-            top_level_window_handle = element.CurrentNativeWindowHandle
-            parent = self.tree_walker.GetParentElement(element)
-            while parent:
-                handle = parent.CurrentNativeWindowHandle
-                if handle != 0 and win32gui.IsWindow(handle) and win32gui.GetParent(handle) == 0:
-                    top_level_window_handle = handle
-                parent = self.tree_walker.GetParentElement(parent)
+            # Tìm cửa sổ cha cấp cao nhất (top-level window)
+            top_level_window_handle = 0
+            try:
+                current = element
+                for _ in range(50): # Giới hạn để tránh vòng lặp vô hạn
+                    handle = current.CurrentNativeWindowHandle
+                    if handle != 0 and win32gui.IsWindow(handle) and win32gui.GetParent(handle) == 0:
+                        top_level_window_handle = handle
+                        break
+                    parent = self.tree_walker.GetParentElement(current)
+                    if not parent or parent.CurrentNativeWindowHandle == current.CurrentNativeWindowHandle:
+                        # Nếu không có cha hoặc cha trùng handle thì dừng
+                        top_level_window_handle = handle if handle !=0 else top_level_window_handle
+                        break
+                    current = parent
+            except comtypes.COMError:
+                self.logger.warning("Lỗi COM khi tìm cửa sổ cha, sử dụng handle của element.")
+                top_level_window_handle = element.CurrentNativeWindowHandle
 
-            window_details = self._get_window_details(top_level_window_handle) if top_level_window_handle else {}
+            # SỬ DỤNG HÀM TỪ UI_CORE
+            window_details = get_window_details(top_level_window_handle) if top_level_window_handle else {}
 
-            format_and_print_dict("WINDOW INFO", window_details)
-            format_and_print_dict("ELEMENT INFO", element_details)
+            # In kết quả
+            print_formatted_dict("WINDOW INFO", window_details)
+            print_formatted_dict("ELEMENT INFO", element_details)
 
         except Exception as e:
-            self.logger.error(f"Đã xảy ra lỗi không mong muốn trong quá trình quét: {e}", exc_info=True)
-
+            self.logger.error(f"Đã xảy ra lỗi không mong muốn trong quá trình quét", exc_info=True)
 
 def main():
     setup_logging()
@@ -253,7 +170,6 @@ def main():
     finally:
         keyboard.unhook_all()
         print("Chương trình đã thoát.")
-
 
 if __name__ == '__main__':
     main()
