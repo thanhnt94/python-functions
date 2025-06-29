@@ -45,10 +45,8 @@ def get_process_info(pid):
             PROC_INFO_CACHE[pid] = info
             return info
         except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-            # Lỗi này khá phổ biến, chỉ cần warning
             logger.warning(f"Không thể truy cập tiến trình PID={pid}: {e}")
         except Exception as e:
-            # Các lỗi khác cần được điều tra
             logger.error(f"Lỗi không xác định khi lấy thông tin tiến trình PID={pid}", exc_info=True)
     return {}
 
@@ -64,20 +62,25 @@ def get_window_details(hwnd):
         return data
 
     try:
-        # Lấy thông tin cơ bản của window
         data['win32_handle'] = hwnd
         data['pwa_title'] = win32gui.GetWindowText(hwnd)
         data['pwa_class_name'] = win32gui.GetClassName(hwnd)
         
-        # Lấy thông tin về process
         thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
         data['proc_pid'] = pid
         data['proc_thread_id'] = thread_id
         data.update(get_process_info(pid))
 
-        # Thử lấy thông tin UIA/pywinauto
         desktop = Desktop(backend='uia')
-        win_element = desktop.window(handle=hwnd).element_info
+        # Lấy đối tượng cửa sổ đầy đủ để truy cập rectangle
+        win_wrapper = desktop.window(handle=hwnd)
+        win_element = win_wrapper.element_info
+        
+        # ===== SỬA LỖI: Bổ sung thông tin tọa độ cho cửa sổ =====
+        rect = win_wrapper.rectangle()
+        data['geo_rectangle_tuple'] = (rect.left, rect.top, rect.right, rect.bottom)
+        # ========================================================
+        
         data['pwa_auto_id'] = win_element.automation_id
         if win_element.control_type:
             data['pwa_control_type'] = win_element.control_type.capitalize()
@@ -98,32 +101,29 @@ def get_element_details_comprehensive(element):
     
     data = {}
     try:
-        # Lấy PID và thông tin process
         pid = element.CurrentProcessId
         data['proc_pid'] = pid
         data.update(get_process_info(pid))
 
-        # Các thuộc tính cơ bản
         data['pwa_title'] = element.CurrentName
         data['pwa_auto_id'] = element.CurrentAutomationId
         data['pwa_class_name'] = element.CurrentClassName
         data['pwa_framework_id'] = element.CurrentFrameworkId
+        data['win32_handle'] = element.CurrentNativeWindowHandle
         
-        # Loại control
         control_type_str = element.CurrentLocalizedControlType or element.CurrentControlType.name.replace('Control', '')
         if control_type_str:
             data['pwa_control_type'] = control_type_str.capitalize()
             
-        # Tọa độ
         rect = element.CurrentBoundingRectangle
         if rect:
             data['geo_bounding_rect_tuple'] = (rect.left, rect.top, rect.right, rect.bottom)
             
+        data['state_is_enabled'] = bool(element.CurrentIsEnabled)
+        
     except comtypes.COMError as e:
-        # Lỗi này thường xảy ra khi element không còn tồn tại, log ở mức warning
         logger.warning(f"Lỗi COM khi truy cập element (có thể đã bị hủy). Lỗi: {e}")
     except Exception as e:
-        # Các lỗi khác cần được điều tra kỹ hơn
         logger.error(f"Lỗi không xác định khi lấy thông tin element", exc_info=True)
         
     return data
@@ -133,19 +133,20 @@ def get_element_details_comprehensive(element):
 def format_dict_as_pep8_string(spec_dict):
     """
     Định dạng dictionary thành chuỗi PEP8 để dễ copy-paste.
-    Loại bỏ các key có giá trị rỗng (None, '').
+    Cải tiến: Tự động loại bỏ các key có giá trị rỗng hoặc không hợp lệ.
     """
     if not spec_dict:
         return "{}"
 
-    # Lọc ra các giá trị không hợp lệ và các key hệ thống
+    # Cải tiến: Chỉ giữ lại các giá trị có ý nghĩa.
+    # Giữ lại boolean False, nhưng loại bỏ None, 0, chuỗi rỗng, list rỗng...
     dict_to_format = {
         k: v for k, v in spec_dict.items()
-        if not k.startswith('sys_') and v is not None and v != ''
+        if not k.startswith('sys_') and (v is False or v)
     }
 
     if not dict_to_format:
         return "{}"
 
-    items_str = [f"    {repr(k)}: {repr(v)}," for k, v in sorted(dict_to_format.items())]
+    items_str = [f"    {repr(k)}: {repr(value)}," for k, value in sorted(dict_to_format.items())]
     return f"{{\n" + "\n".join(items_str) + "\n}"

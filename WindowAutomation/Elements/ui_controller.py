@@ -2,6 +2,8 @@
 import logging
 import re
 import time
+import math
+import threading
 from datetime import datetime
 
 # --- Thư viện cần thiết ---
@@ -12,18 +14,16 @@ try:
     import win32con
     import win32api
     import pyperclip
+    from pynput import mouse, keyboard
     from pywinauto.findwindows import ElementNotFoundError
-    from pywinauto.application import Application
     from pywinauto import Desktop
 except ImportError as e:
-    if 'pyperclip' in str(e):
-        print("Lỗi: Thiếu thư viện 'pyperclip'. Vui lòng cài đặt bằng lệnh: pip install pyperclip")
-    else:
-        print(f"Lỗi import thư viện, vui lòng cài đặt: {e}")
+    print(f"Lỗi import thư viện, vui lòng cài đặt: {e}")
     exit()
 
 # --- Import từ các module tùy chỉnh ---
 from ui_spec_definitions import get_all_supported_keys
+from ui_core import get_process_info
 
 # --- Cấu hình logging ---
 if not logging.getLogger().hasHandlers():
@@ -33,221 +33,257 @@ if not logging.getLogger().hasHandlers():
     )
 
 # --- Định nghĩa Exception tùy chỉnh ---
-class UIActionError(Exception):
-    """Lỗi chung cho các hành động trên UI."""
-    pass
-
-class WindowNotFoundError(UIActionError):
-    """Ném ra khi không tìm thấy cửa sổ sau một khoảng thời gian."""
-    pass
-
-class AmbiguousElementError(UIActionError):
-    """Ném ra khi tìm thấy nhiều hơn một element thỏa mãn."""
-    pass
+class UIActionError(Exception): pass
+class WindowNotFoundError(UIActionError): pass
+class AmbiguousElementError(UIActionError): pass
 
 class UIController:
-    """
-    Lớp đóng gói logic để tìm kiếm, tương tác, và lấy thuộc tính
-    từ các thành phần giao diện người dùng trên Windows.
-    """
-    SELECTOR_KEYWORDS = [
-        'latest', 'oldest', 'deepest', 'shallowest', 'most', 'fewest',
-        'topmost', 'bottommost', 'leftmost', 'rightmost', 'longest', 'shortest'
-    ]
     SUPPORTED_KEYS = get_all_supported_keys()
-
-    # --- THAY ĐỔI 1: Liệt kê các action KHÔNG cần activate ---
-    # Bất kỳ action nào không có trong danh sách này sẽ mặc định yêu cầu activate.
-    BACKGROUND_SAFE_ACTIONS = {
-        'set_text', 
-        'send_message_text'
+    BACKGROUND_SAFE_ACTIONS = {'set_text', 'send_message_text'}
+    SORTING_KEYS = {
+        'sort_by_creation_time', 'sort_by_title_length', 'sort_by_child_count',
+        'sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height',
+        'z_order_index'
     }
 
-    def __init__(self, backend='uia'):
-        """
-        Khởi tạo UIController.
-        
-        Args:
-            backend (str): Backend của pywinauto ('uia' hoặc 'win32').
-        """
+    def __init__(self, backend='uia', human_interruption_detection=False, human_cooldown_period=5):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.desktop = Desktop(backend=backend)
-        self.logger.info(f"UIController đã khởi tạo với backend '{backend}'.")
+        self.human_interruption_detection = human_interruption_detection
+        self.human_cooldown_period = human_cooldown_period
+        self._last_human_activity_time = 0
+        self._is_bot_acting = False
+        self._bot_acting_lock = threading.Lock()
+        if self.human_interruption_detection:
+            self._start_input_listener()
+
+    def select_element(self, window_spec, element_spec=None, timeout=10):
+        self.logger.info("Bắt đầu tác vụ: select_element (Standalone)")
+        target_element = self._find_target(window_spec, element_spec, timeout)
+        self.logger.info(f"-> Lựa chọn THÀNH CÔNG. Đã tìm thấy: '{target_element.window_text()}'\n")
+        return target_element
+
+    def run_action(self, window_spec, element_spec=None, action=None, timeout=10, auto_activate=False):
+        self.logger.info(f"Bắt đầu tác vụ: run_action='{action or 'Find Only'}'")
+        try:
+            self._wait_for_user_idle()
+            target_element = self._find_target(window_spec, element_spec, timeout)
+            if action:
+                command = action.split(':', 1)[0].lower().strip()
+                if command not in self.BACKGROUND_SAFE_ACTIONS:
+                    self._handle_activation(target_element, command, timeout, auto_activate)
+                self.logger.info(f"-> Bắt đầu thực thi hành động '{action}'...")
+                self._execute_action_safely(target_element, action)
+            self.logger.info("--- TÁC VỤ HOÀN TẤT THÀNH CÔNG ---\n")
+            return True
+        except (WindowNotFoundError, ElementNotFoundError, AmbiguousElementError, UIActionError) as e:
+            self.logger.error(f"Lỗi trong quá trình thực thi: {type(e).__name__} - {e}")
+            self.logger.error("--- TÁC VỤ THẤT BẠI ---\n")
+            return False
+        except Exception as e:
+            self.logger.error(f"Lỗi không mong muốn trong run_action: {e}", exc_info=True)
+            self.logger.error("--- TÁC VỤ THẤT BẠI ---\n")
+            return False
+
+    def get_property(self, window_spec, element_spec=None, property_name=None, timeout=10):
+        self.logger.info(f"Bắt đầu tác vụ: get_property='{property_name}'")
+        self._wait_for_user_idle()
+        target_element = self._find_target(window_spec, element_spec, timeout)
+        value = self._get_property_value(target_element, property_name)
+        self.logger.info(f"-> THÀNH CÔNG. Lấy thuộc tính '{property_name}' có giá trị = {repr(value)}\n")
+        return value
+
+    def _start_input_listener(self):
+        listener_thread = threading.Thread(target=self._run_listeners, daemon=True)
+        listener_thread.start()
+
+    def _update_last_activity(self, *args):
+        with self._bot_acting_lock:
+            if not self._is_bot_acting:
+                self._last_human_activity_time = time.time()
+
+    def _run_listeners(self):
+        with mouse.Listener(on_move=self._update_last_activity, on_click=self._update_last_activity, on_scroll=self._update_last_activity) as m_listener:
+            with keyboard.Listener(on_press=self._update_last_activity) as k_listener:
+                m_listener.join()
+                k_listener.join()
+
+    def _wait_for_user_idle(self):
+        if not self.human_interruption_detection: return
+        idle_since = self._last_human_activity_time
+        if time.time() - idle_since < self.human_cooldown_period:
+            self.logger.info("Phát hiện người dùng đang hoạt động. Chương trình sẽ tạm dừng...")
+            while True:
+                if self._last_human_activity_time > idle_since:
+                    idle_since = self._last_human_activity_time
+                
+                idle_duration = time.time() - idle_since
+                if idle_duration >= self.human_cooldown_period:
+                    self.logger.info("Người dùng đã ngừng hoạt động. Tiếp tục thực thi...")
+                    print()
+                    break
+                
+                remaining = self.human_cooldown_period - idle_duration
+                print(f"\rChờ người dùng... tiếp tục sau {remaining:.1f} giây. ", end="", flush=True)
+                time.sleep(0.5)
+
+    def _execute_action_safely(self, element, action_str):
+        with self._bot_acting_lock:
+            self._is_bot_acting = True
+        try:
+            self._execute_action(element, action_str)
+        finally:
+            with self._bot_acting_lock:
+                self._is_bot_acting = False
 
     def _find_target(self, window_spec, element_spec=None, timeout=10):
-        """Vòng lặp chính để tìm kiếm cửa sổ và element với cơ chế chờ đợi."""
-        self.logger.info(f"Đang chờ và tìm kiếm mục tiêu trong tối đa {timeout} giây...")
         start_time = time.time()
         last_error = ""
-
         while time.time() - start_time < timeout:
             try:
-                window = self._find_unique_element(
-                    spec=window_spec,
-                    find_func=lambda **kwargs: self.desktop.windows(**kwargs),
-                    search_type="Window"
-                )
-                
-                self.logger.info(f"Tìm thấy cửa sổ đích: Title='{window.window_text()}', Handle='{window.handle}'")
-                
+                window = self._find_unique_element(window_spec, self.desktop.windows, "Window")
                 if not element_spec:
                     return window
-
-                element = self._find_unique_element(
-                    spec=element_spec,
-                    find_func=window.descendants,
-                    search_type="Element"
-                )
-                return element
-            except (ElementNotFoundError, AmbiguousElementError) as e:
+                return self._find_unique_element(element_spec, window.descendants, "Element")
+            except ElementNotFoundError as e:
                 last_error = str(e)
                 time.sleep(0.5)
-                continue
         raise WindowNotFoundError(f"Không thể tìm thấy mục tiêu sau {timeout} giây. Lỗi cuối cùng: {last_error}")
 
+    def _handle_activation(self, target_element, command, timeout, auto_activate):
+        top_window = target_element.top_level_parent()
+        if not top_window.is_active():
+            if auto_activate:
+                self.logger.info(f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
+                top_window.set_focus()
+                
+                wait_start = time.time()
+                while time.time() - wait_start < 5:
+                    if top_window.is_active():
+                        self.logger.info("-> Kích hoạt thành công.")
+                        return
+                    time.sleep(0.2)
+                raise UIActionError("Nỗ lực tự động kích hoạt cửa sổ thất bại.")
+            else:
+                # ===== NÂNG CẤP LOGGING THEO YÊU CẦU =====
+                self.logger.info(f"Hành động '{command}' yêu cầu cửa sổ '{top_window.window_text()}' được kích hoạt.")
+                self.logger.warning(f"Cửa sổ không được active. Vì 'auto_activate=False', chương trình sẽ chờ bạn click chuột vào cửa sổ.")
+                self.logger.info(f"Đang chờ người dùng kích hoạt cửa sổ (tối đa {timeout} giây)...")
+                # ==========================================
+                
+                wait_start_time = time.time()
+                while time.time() - wait_start_time < timeout:
+                    if top_window.is_active():
+                        self.logger.info("Cửa sổ đã được kích hoạt. Tiếp tục thực thi.")
+                        return
+                    time.sleep(0.5)
+                raise UIActionError(f"Hết thời gian chờ. Cửa sổ không được kích hoạt trong {timeout} giây.")
+
     def _find_unique_element(self, spec, find_func, search_type):
-        """Quy trình: Lọc thô -> Lọc tinh -> Lựa chọn."""
         filter_spec, selector_spec = self._split_spec(spec)
-        pwa_native_spec, other_filters = self._split_pwa_native_spec(filter_spec, search_type)
-
-        self.logger.debug(f"[{search_type}] Lọc thô với tiêu chí PWA: {pwa_native_spec}")
-        candidates = find_func(**pwa_native_spec)
-
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Lọc thô thất bại với: {pwa_native_spec}")
-
-        self.logger.debug(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên. Lọc tinh với: {other_filters}")
-        candidates = self._apply_filters(candidates, other_filters)
-
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Lọc tinh thất bại với: {other_filters}")
-
-        if len(candidates) > 1 and selector_spec:
-            self.logger.debug(f"[{search_type}] Còn {len(candidates)} ứng viên. Áp dụng lựa chọn: {selector_spec}")
-            for key, selector in selector_spec.items():
-                candidates = self._apply_selector(candidates, key, selector)
-                if len(candidates) <= 1:
-                    break
-
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Không còn ứng viên sau khi lựa chọn.")
+        native_spec, custom_filters = self._split_pwa_native_spec(filter_spec)
+        
+        candidates = find_func(**native_spec)
+        if not candidates: raise ElementNotFoundError(f"[{search_type}] Lọc thô thất bại với: {native_spec}")
+        
+        candidates = self._apply_filters(candidates, custom_filters)
+        if not candidates: raise ElementNotFoundError(f"[{search_type}] Lọc tinh thất bại với: {custom_filters}")
+        
+        candidates = self._apply_selectors(candidates, selector_spec)
+        
         if len(candidates) > 1:
-            self.logger.warning(f"Tìm thấy {len(candidates)} ứng viên không thể phân biệt:")
-            for i, c in enumerate(candidates[:5]):
-                self.logger.warning(f"  - Ứng viên {i+1}: name='{c.window_text()}', class='{c.class_name()}'")
-            raise AmbiguousElementError(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên không thể phân biệt.")
+            details = [f"'{c.window_text()}' (pid: {c.process_id()})" for c in candidates[:5]]
+            raise AmbiguousElementError(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên không rõ ràng: {details}")
+        if not candidates:
+            raise ElementNotFoundError(f"[{search_type}] Không còn ứng viên nào sau khi lựa chọn.")
 
         return candidates[0]
 
     def _split_spec(self, spec):
-        """Tách spec thành filter_spec và selector_spec."""
-        filter_spec, selector_spec = {}, {}
-        if not spec:
-            return {}, {}
-        for key, value in spec.items():
-            if isinstance(value, str) and value.lower() in self.SELECTOR_KEYWORDS:
-                selector_spec[key] = value.lower()
-            else:
-                filter_spec[key] = value
+        filter_spec = {k: v for k, v in spec.items() if k not in self.SORTING_KEYS}
+        selector_spec = {k: v for k, v in spec.items() if k in self.SORTING_KEYS}
         return filter_spec, selector_spec
 
-    def _split_pwa_native_spec(self, spec, search_type):
-        """
-        Tách spec thành các tiêu chí pwa gốc và các tiêu chí lọc tinh.
-        Hàm này giờ sẽ phân biệt giữa việc tìm Window và Element.
-        """
-        pwa_native_spec = {}
-        other_filters = {}
-
-        key_map = {
-            'pwa_title': 'title',
-            'pwa_class_name': 'class_name',
-            'pwa_control_type': 'control_type',
-            'pwa_auto_id': 'automation_id',
-            'win32_handle': 'handle'
+    def _split_pwa_native_spec(self, spec):
+        native_spec, custom_filters = {}, {}
+        native_keys = {
+            'pwa_title': 'title', 
+            'pwa_class_name': 'class_name', 
+            'win32_handle': 'handle',
+            'proc_pid': 'process'
         }
-
+        
         for key, value in spec.items():
-            if key not in key_map:
-                other_filters[key] = value
-                continue
-            
-            if key in ['pwa_auto_id', 'win32_handle'] and search_type != "Window":
-                other_filters[key] = value
-                continue
-
-            mapped_key = key_map[key]
-
-            if isinstance(value, tuple) and len(value) == 2 and value[0].lower() == 'regex':
-                if search_type == "Window":
-                    pwa_native_spec[mapped_key + '_re'] = value[1]
+            if key in native_keys:
+                mapped_key = native_keys[key]
+                if isinstance(value, tuple) and value[0].lower() == 'regex' and mapped_key in ['title', 'class_name']:
+                    native_spec[mapped_key + '_re'] = value[1]
                 else:
-                    other_filters[key] = value
+                    native_spec[mapped_key] = value
             else:
-                pwa_native_spec[mapped_key] = value
-
-        return pwa_native_spec, other_filters
+                custom_filters[key] = value
+                
+        return native_spec, custom_filters
 
     def _apply_filters(self, elements, spec):
-        """Áp dụng các bộ lọc nâng cao trên danh sách elements."""
-        if not spec:
-            return elements
+        if not spec: return elements
         return [elem for elem in elements if self._element_matches_spec(elem, spec)]
 
     def _element_matches_spec(self, elem, spec):
-        """Kiểm tra một element có khớp với tất cả tiêu chí trong spec không."""
         for key, criteria in spec.items():
             actual_value = self._get_actual_value(elem, key)
             if not self._check_condition(actual_value, criteria):
                 return False
         return True
 
-    def _apply_selector(self, candidates, key, selector):
-        """Áp dụng bộ chọn để tìm ra element tốt nhất."""
-        if not candidates:
-            return []
+    def _apply_selectors(self, candidates, selectors):
+        if not selectors: return candidates
+        sorted_candidates = list(candidates)
+        for key, index in selectors.items():
+            if key == 'z_order_index': continue
+            sort_key_func = self._get_sort_key_function(key)
+            if sort_key_func:
+                reverse_order = (index < 0)
+                sorted_candidates.sort(key=sort_key_func, reverse=reverse_order)
         
-        use_max = selector in ['latest', 'deepest', 'most', 'bottommost', 'rightmost', 'longest']
+        final_index = 0
+        if 'z_order_index' in selectors:
+            final_index = selectors['z_order_index']
+        elif selectors:
+            last_selector_key = list(selectors.keys())[-1]
+            final_index = selectors[last_selector_key]
+            final_index = final_index - 1 if final_index > 0 else final_index
         
-        valid_candidates = []
-        for c in candidates:
-            val = self._get_actual_value(c, key)
-            if val is not None:
-                valid_candidates.append((c, val))
-        
-        if not valid_candidates:
-            return []
-
-        def get_sort_key(item):
-            _key, _val = item[0], item[1]
-            if key.endswith('tuple') and selector in ('topmost', 'bottommost'): return _val[1]
-            if key.endswith('tuple') and selector in ('leftmost', 'rightmost'): return _val[0]
-            if key == 'pwa_title' and selector in ('longest', 'shortest'): return len(str(_val))
-            return _val
-
         try:
-            sorted_candidates = sorted(valid_candidates, key=get_sort_key, reverse=use_max)
-            return [sorted_candidates[0][0]]
-        except Exception as e:
-            self.logger.warning(f"Lỗi khi sắp xếp selector '{key}': {e}", exc_info=True)
-            return []
+            return [sorted_candidates[final_index]]
+        except IndexError:
+            raise ElementNotFoundError(f"Lựa chọn index={final_index} nằm ngoài phạm vi ({len(sorted_candidates)} ứng viên).")
+        
+    def _get_sort_key_function(self, key):
+        if key == 'sort_by_creation_time':
+            return lambda e: self._get_actual_value(e, 'proc_create_time') or 0
+        if key == 'sort_by_title_length':
+            return lambda e: len(self._get_actual_value(e, 'pwa_title') or '')
+        if key == 'sort_by_child_count':
+            return lambda e: self._get_actual_value(e, 'rel_child_count') or 0
+        if key in ['sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height']:
+            def get_rect_prop(elem, prop_key):
+                rect = self._get_actual_value(elem, 'geo_bounding_rect_tuple')
+                if not rect: return 0
+                if prop_key == 'sort_by_y_pos': return rect[1]
+                if prop_key == 'sort_by_x_pos': return rect[0]
+                if prop_key == 'sort_by_width': return rect[2] - rect[0]
+                if prop_key == 'sort_by_height': return rect[3] - rect[1]
+            return lambda e: get_rect_prop(e, key)
+        return None
 
     def _get_actual_value(self, element, prefixed_key):
-        """Lấy giá trị thực tế của một thuộc tính từ element một cách an toàn."""
-        if prefixed_key not in self.SUPPORTED_KEYS:
-            self.logger.warning(f"Thuộc tính '{prefixed_key}' không được hỗ trợ. Bỏ qua.")
-            return None
-        
+        if prefixed_key not in self.SUPPORTED_KEYS: return None
         try:
             if prefixed_key.startswith('pwa_'):
-                prop_map = {
-                    'pwa_title': 'name', 'pwa_auto_id': 'automation_id',
-                    'pwa_class_name': 'class_name', 'pwa_control_type': 'control_type',
-                    'pwa_framework_id': 'framework_id'
-                }
+                prop_map = {'pwa_title': 'name', 'pwa_auto_id': 'automation_id', 'pwa_class_name': 'class_name', 'pwa_control_type': 'control_type', 'pwa_framework_id': 'framework_id'}
                 prop = prop_map.get(prefixed_key)
                 return getattr(element.element_info, prop, None) if prop else None
-
             if prefixed_key.startswith('state_'):
                 if prefixed_key == 'state_is_visible': return element.is_visible()
                 if prefixed_key == 'state_is_enabled': return element.is_enabled()
@@ -259,7 +295,6 @@ class UIController:
                 if prefixed_key == 'state_is_offscreen': return element.is_offscreen()
                 if prefixed_key == 'state_is_content_element': return element.is_content_element()
                 if prefixed_key == 'state_is_control_element': return element.is_control_element()
-
             handle = element.handle
             if handle:
                 if prefixed_key.startswith('win32_'):
@@ -268,23 +303,19 @@ class UIController:
                     if prefixed_key == 'win32_extended_styles': return hex(win32gui.GetWindowLong(handle, win32con.GWL_EXSTYLE))
                 if prefixed_key == 'rel_parent_handle': return win32gui.GetParent(handle)
                 if prefixed_key == 'proc_thread_id': return win32process.GetWindowThreadProcessId(handle)[0]
-
             if prefixed_key.startswith('geo_'):
                 rect = element.rectangle()
-                if prefixed_key in ['geo_rectangle_tuple', 'geo_bounding_rect_tuple']:
-                    return rect.left, rect.top, rect.right, rect.bottom
-                if prefixed_key == 'geo_center_point':
-                    return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
-            
+                if prefixed_key in ['geo_rectangle_tuple', 'geo_bounding_rect_tuple']: return rect.left, rect.top, rect.right, rect.bottom
+                if prefixed_key == 'geo_center_point': return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
             if prefixed_key.startswith('proc_'):
-                p = psutil.Process(element.process_id())
-                if prefixed_key == 'proc_pid': return p.pid
-                if prefixed_key == 'proc_name': return p.name()
-                if prefixed_key == 'proc_create_time': return p.create_time()
-                if prefixed_key == 'proc_path': return p.exe()
-                if prefixed_key == 'proc_cmdline': return ' '.join(p.cmdline())
-                if prefixed_key == 'proc_username': return p.username()
-
+                pid = element.process_id()
+                if prefixed_key == 'proc_pid': return pid
+                proc_info = get_process_info(pid)
+                if prefixed_key == 'proc_name': return proc_info.get('proc_name')
+                if prefixed_key == 'proc_create_time': return proc_info.get('proc_create_time')
+                if prefixed_key == 'proc_path': return proc_info.get('proc_path')
+                if prefixed_key == 'proc_cmdline': return proc_info.get('proc_cmdline')
+                if prefixed_key == 'proc_username': return proc_info.get('proc_username')
             if prefixed_key.startswith('rel_'):
                 if prefixed_key == 'rel_level':
                     level, current = 0, element
@@ -294,31 +325,23 @@ class UIController:
                         current, level = parent, level + 1
                     return level
                 if prefixed_key == 'rel_child_count': return len(element.children())
-                if prefixed_key == 'rel_parent_title': return element.parent().window_text()
-                if prefixed_key == 'rel_labeled_by': return element.labeled_by().window_text()
-
-            if prefixed_key.startswith('uia_'):
-                pass
-        except Exception as e:
-            self.logger.error(f"Lỗi khi lấy giá trị cho thuộc tính '{prefixed_key}' của element '{element.window_text()}'.", exc_info=True)
+                if prefixed_key == 'rel_parent_title': return element.parent().window_text() if element.parent() else None
+                if prefixed_key == 'rel_labeled_by': return element.labeled_by().window_text() if hasattr(element, 'labeled_by') and element.labeled_by() else None
             return None
-        
-        self.logger.debug(f"Thuộc tính '{prefixed_key}' không có giá trị hoặc không áp dụng cho element này.")
-        return None
+        except Exception as e:
+            self.logger.debug(f"Lỗi nhỏ khi lấy thuộc tính '{prefixed_key}': {e}")
+            return None
 
     def _check_condition(self, actual_value, criteria):
-        """So sánh giá trị thực tế với điều kiện đưa ra."""
-        if not isinstance(criteria, tuple):
-            return actual_value == criteria
-        if len(criteria) != 2:
-            self.logger.error(f"Criteria '{criteria}' không hợp lệ. Phải là một tuple (operator, value).")
-            return False
-
+        if not isinstance(criteria, tuple): return actual_value == criteria
+        if len(criteria) != 2: return False
         operator, target_value = criteria
-        if actual_value is None:
-            return False
-
+        if actual_value is None: return False
         op = str(operator).lower()
+        if op == 'is_within':
+            l, t, r, b = actual_value
+            x1, y1, x2, y2 = target_value
+            return l >= x1 and t >= y1 and r <= x2 and b <= y2
         if op in ('contains', 'icontains', 'startswith', 'endswith', 'regex'):
             str_actual, str_target = str(actual_value), str(target_value)
             if op == 'contains': return str_target in str_actual
@@ -333,23 +356,16 @@ class UIController:
                 if op == '>=': return num_actual >= num_target
                 if op == '<': return num_actual < num_target
                 if op == '<=': return num_actual <= num_target
-            except (ValueError, TypeError):
-                return False
-        if op == 'in':
-            return actual_value in target_value
-
-        self.logger.warning(f"Toán tử '{operator}' chưa được hỗ trợ.")
+            except (ValueError, TypeError): return False
+        if op == 'in': return actual_value in target_value
         return False
 
     def _execute_action(self, element, action_str):
-        """Thực thi một chuỗi hành động trên element với các action riêng biệt."""
         self.logger.debug(f"Thực thi hành động '{action_str}' trên element '{element.window_text()}'")
         parts = action_str.split(':', 1)
         command = parts[0].lower().strip()
         value = parts[1] if len(parts) > 1 else None
-
         try:
-            # Các hành động cơ bản
             if command == 'click': element.click_input()
             elif command == 'double_click': element.double_click_input()
             elif command == 'right_click': element.right_click_input()
@@ -359,40 +375,26 @@ class UIController:
             elif command == 'select':
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
                 element.select(value)
-            
-            # --- CÁC ACTION NHẬP LIỆU RIÊNG BIỆT ---
             elif command == 'set_text':
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
-                self.logger.debug("Thực hiện action 'set_text' (phương pháp set_edit_text).")
                 element.set_edit_text(value)
-
             elif command == 'paste_text':
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
-                self.logger.debug("Thực hiện action 'paste_text' (phương pháp pyperclip).")
                 pyperclip.copy(value)
                 element.type_keys('^a^v', pause=0.1) 
-
             elif command == 'type_keys':
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
-                self.logger.debug("Thực hiện action 'type_keys' (phương pháp mô phỏng gõ phím).")
                 element.type_keys(value, with_spaces=True, with_newlines=True, pause=0.01)
-
             elif command == 'send_message_text':
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
-                self.logger.debug("Thực hiện action 'send_message_text' (phương pháp SendMessage).")
-                if not element.handle:
-                    raise UIActionError("Action 'send_message_text' yêu cầu element phải có handle.")
+                if not element.handle: raise UIActionError("Action 'send_message_text' yêu cầu element phải có handle.")
                 win32api.SendMessage(element.handle, win32con.WM_SETTEXT, 0, value)
-
             else:
                 raise ValueError(f"Hành động '{command}' không được hỗ trợ.")
-
         except Exception as e:
-            error_message = f"Thực thi hành động '{action_str}' thất bại. Lỗi gốc: {type(e).__name__} - {e}"
-            raise UIActionError(error_message) from e
+            raise UIActionError(f"Thực thi hành động '{action_str}' thất bại. Lỗi gốc: {type(e).__name__} - {e}") from e
 
     def _get_property_value(self, element, property_name):
-        """Lấy giá trị của một thuộc tính cụ thể từ element."""
         prop = property_name.lower()
         try:
             if prop == 'text': return element.window_text()
@@ -403,85 +405,3 @@ class UIController:
         except Exception as e:
             self.logger.error(f"Lỗi khi lấy thuộc tính '{prop}': {e}", exc_info=True)
             return None
-
-    # --- THAY ĐỔI 2: Đưa auto_activate vào làm tham số của hàm run_action ---
-    def run_action(self, window_spec, element_spec=None, action=None, timeout=10, auto_activate=False):
-        """
-        Tìm một element và thực hiện một hành động trên nó.
-
-        Args:
-            window_spec (dict): Tiêu chí tìm cửa sổ.
-            element_spec (dict, optional): Tiêu chí tìm element con. Defaults to None.
-            action (str, optional): Chuỗi hành động cần thực thi. Defaults to None.
-            timeout (int, optional): Thời gian chờ tối đa. Defaults to 10.
-            auto_activate (bool, optional): Nếu True, sẽ tự động kích hoạt cửa sổ. 
-                                            Nếu False, sẽ chờ người dùng. Defaults to False.
-        """
-        self.logger.info(f"Bắt đầu tác vụ: action='{action or 'Find Only'}'")
-        self.logger.debug(f"  - Window Spec: {window_spec}")
-        self.logger.debug(f"  - Element Spec: {element_spec}")
-        self.logger.debug(f"  - Auto Activate: {auto_activate}")
-        try:
-            self.logger.info("-> Bước 1: Bắt đầu tìm kiếm mục tiêu...")
-            target_element = self._find_target(window_spec, element_spec, timeout)
-            if element_spec is None:
-                 self.logger.info(f"-> Bước 1: THÀNH CÔNG. Đã tìm thấy mục tiêu (Cửa sổ): '{target_element.window_text()}'")
-            else:
-                 self.logger.info(f"-> Bước 1: THÀNH CÔNG. Đã tìm thấy mục tiêu (Element): '{target_element.window_text()}'")
-
-            if action:
-                # --- CƠ CHẾ CHỜ HOẶC TỰ ĐỘNG KÍCH HOẠT ---
-                command = action.split(':', 1)[0].lower().strip()
-                # Nếu action không nằm trong danh sách an toàn, nó cần được kích hoạt
-                if command not in self.BACKGROUND_SAFE_ACTIONS:
-                    top_window = target_element.top_level_parent()
-                    if not top_window.is_active():
-                        if auto_activate:
-                            self.logger.info(f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
-                            top_window.set_focus()
-                            time.sleep(0.5) 
-                            if not top_window.is_active():
-                                raise UIActionError("Nỗ lực tự động kích hoạt cửa sổ thất bại.")
-                        else:
-                            self.logger.info(f"Hành động '{command}' yêu cầu cửa sổ '{top_window.window_text()}' được kích hoạt.")
-                            self.logger.info(f"Đang chờ người dùng kích hoạt cửa sổ (tối đa {timeout} giây)...")
-                            
-                            wait_start_time = time.time()
-                            while time.time() - wait_start_time < timeout:
-                                if top_window.is_active():
-                                    self.logger.info("Cửa sổ đã được kích hoạt. Tiếp tục thực thi.")
-                                    break
-                                time.sleep(0.5)
-                            else:
-                                raise UIActionError(f"Hết thời gian chờ. Cửa sổ không được kích hoạt trong {timeout} giây.")
-
-                self.logger.info(f"-> Bước 2: Bắt đầu thực thi hành động '{action}'...")
-                self._execute_action(target_element, action)
-                self.logger.info(f"-> Bước 2: THÀNH CÔNG. Đã thực thi hành động '{action}'.")
-
-            self.logger.info(f"--- TÁC VỤ '{action or 'Find Only'}' HOÀN TẤT THÀNH CÔNG ---\n")
-            return True
-        except (WindowNotFoundError, ElementNotFoundError, AmbiguousElementError, UIActionError) as e:
-            self.logger.error(f"Lỗi trong quá trình thực thi: {type(e).__name__} - {e}")
-            self.logger.error("--- TÁC VỤ THẤT BẠI ---\n")
-            return False
-        except Exception as e:
-            self.logger.error(f"Lỗi không mong muốn trong run_action: {type(e).__name__} - {e}", exc_info=True)
-            self.logger.error("--- TÁC VỤ THẤT BẠI ---\n")
-            return False
-
-    def get_property(self, window_spec, element_spec, property_name, timeout=10):
-        """Tìm một element và lấy giá trị của một thuộc tính cụ thể."""
-        self.logger.info(f"Bắt đầu lấy thuộc tính: '{property_name}'")
-        try:
-            target_element = self._find_target(window_spec, element_spec, timeout)
-            value = self._get_property_value(target_element, property_name)
-            self.logger.info(f"Lấy thuộc tính '{property_name}' thành công, giá trị = {repr(value)}\n")
-            return value
-        except (WindowNotFoundError, ElementNotFoundError, AmbiguousElementError) as e:
-            self.logger.error(f"Lỗi tìm kiếm khi lấy thuộc tính: {e}")
-            return None
-        except Exception as e:
-            self.logger.error(f"Lỗi khi lấy thuộc tính '{property_name}': {type(e).__name__} - {e}", exc_info=True)
-            return None
-
