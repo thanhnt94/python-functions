@@ -40,6 +40,10 @@ except (ImportError, ModuleNotFoundError):
 #                      BỘ ĐỊNH NGHĨA VÀ HÀM LÕI
 # ======================================================================
 
+HIGHLIGHT_DURATION_MS = 2500 
+INTERACTIVE_DIALOG_WIDTH = 350
+INTERACTIVE_DIALOG_HEIGHT = 400  
+
 QUICK_SPEC_WINDOW_KEYS = [
     'win32_handle', 
     'pwa_title', 
@@ -99,7 +103,7 @@ def _get_process_info(pid):
         except (psutil.NoSuchProcess, psutil.AccessDenied): pass
     return {}
 
-def _get_element_details_comprehensive(element):
+def _get_element_details_comprehensive(element, tree_walker):
     if not element:
         logging.warning("Đối tượng element không hợp lệ.")
         return {}
@@ -138,15 +142,28 @@ def _get_element_details_comprehensive(element):
         rect = element.CurrentBoundingRectangle
         if rect: data['geo_bounding_rect_tuple'] = (rect.left, rect.top, rect.right, rect.bottom)
     except Exception: pass
+    
+    level = 0
+    current = element
+    try:
+        while True:
+            parent = tree_walker.GetParentElement(current)
+            if not parent or parent.CurrentNativeWindowHandle == 0:
+                break
+            current = parent
+            level += 1
+    except comtypes.COMError:
+        pass
+    data['rel_level'] = level
 
     logging.info("Hoàn tất thu thập thông tin element.")
     return {k: v for k, v in data.items() if v is not None}
 
-def _get_window_details(hwnd, uia_instance):
+def _get_window_details(hwnd, uia_instance, tree_walker):
     if not win32gui.IsWindow(hwnd): return {}
     try:
         element = uia_instance.ElementFromHandle(hwnd)
-        return _get_element_details_comprehensive(element)
+        return _get_element_details_comprehensive(element, tree_walker)
     except comtypes.COMError:
         data = {}
         data['win32_handle'] = hwnd
@@ -180,6 +197,17 @@ def _create_quick_spec_string(window_info, element_info):
     
     return f"{win_str}\n{elem_str}"
 
+def _clean_element_spec(window_info, element_info):
+    if not window_info or not element_info:
+        return element_info
+    
+    cleaned_spec = element_info.copy()
+    if window_info.get('proc_pid') == element_info.get('proc_pid'):
+        for key in list(cleaned_spec.keys()):
+            if key.startswith('proc_'):
+                del cleaned_spec[key]
+    return cleaned_spec
+
 # ======================================================================
 #                      LỚP UIINSPECTOR CHÍNH
 # ======================================================================
@@ -189,6 +217,7 @@ class UIInspector:
         if UIA is None: raise RuntimeError("UIAutomationClient không thể khởi tạo.")
         self.logger = logging.getLogger(self.__class__.__name__)
         self.root_gui = root_gui
+        self.current_element = None
         try:
             self.uia = comtypes.client.CreateObject(UIA.CUIAutomation)
             self.tree_walker = self.uia.ControlViewWalker
@@ -212,7 +241,7 @@ class UIInspector:
         logging.getLogger().setLevel(logging.INFO)
         
         try:
-            window_data = _get_window_details(active_hwnd, self.uia)
+            window_data = _get_window_details(active_hwnd, self.uia, self.tree_walker)
             all_elements_data = []
             root_element = self.uia.ElementFromHandle(active_hwnd)
             if root_element: self._walk_element_tree(root_element, 0, all_elements_data)
@@ -254,9 +283,8 @@ class UIInspector:
     def _walk_element_tree(self, element, level, all_elements_data, max_depth=25):
         if element is None or level > max_depth: return
         try:
-            element_data = _get_element_details_comprehensive(element)
+            element_data = _get_element_details_comprehensive(element, self.tree_walker)
             if element_data:
-                element_data['rel_level'] = level
                 all_elements_data.append(element_data)
             child = self.tree_walker.GetFirstChildElement(element)
             while child:
@@ -265,49 +293,132 @@ class UIInspector:
                 except comtypes.COMError: break
         except Exception: pass
 
+    def _find_main_window_from_pid(self, pid):
+        def callback(hwnd, hwnds):
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if found_pid == pid:
+                    hwnds.append(hwnd)
+            return True
+        hwnds = []
+        win32gui.EnumWindows(callback, hwnds)
+        return hwnds[0] if hwnds else 0
+
     def _run_scan_at_cursor(self):
         self.logger.info("Yêu cầu quét đã được ghi nhận từ F8.")
+        
+        self.root_gui.destroy_highlight()
+        
         try:
             cursor_pos = win32gui.GetCursorPos()
             point = wintypes.POINT(cursor_pos[0], cursor_pos[1])
             element = self.uia.ElementFromPoint(point)
+            
             if not element: 
                 self.logger.warning("Không tìm thấy element nào dưới con trỏ.")
                 return
 
-            top_level_element = element
-            try:
-                parent = self.tree_walker.GetParentElement(top_level_element)
-                while parent:
-                    if not parent or parent.CurrentNativeWindowHandle == 0: break
-                    top_level_element = parent
-                    parent = self.tree_walker.GetParentElement(top_level_element)
-                top_level_window_handle = top_level_element.CurrentNativeWindowHandle
-            except comtypes.COMError:
-                top_level_window_handle = element.CurrentNativeWindowHandle
+            smallest_element = element
+            while True:
+                try:
+                    child = self.tree_walker.GetFirstChildElement(smallest_element)
+                    found_deeper = False
+                    while child:
+                        child_rect = child.CurrentBoundingRectangle
+                        if (point.x >= child_rect.left and point.x <= child_rect.right and
+                            point.y >= child_rect.top and point.y <= child_rect.bottom):
+                            smallest_element = child
+                            found_deeper = True
+                            break
+                        child = self.tree_walker.GetNextSiblingElement(child)
+                    if not found_deeper:
+                        break
+                except comtypes.COMError:
+                    break
+            
+            self.current_element = smallest_element
+            self._inspect_element(self.current_element)
 
-            element_details = _get_element_details_comprehensive(element)
-            window_details = _get_window_details(top_level_window_handle, self.uia)
-            
-            coords = element_details.get('geo_bounding_rect_tuple')
-            if coords: self._draw_highlight_rectangle(coords)
-            
-            self.root_gui.update_spec_dialog(window_details, element_details)
         except Exception as e:
             self.logger.error(f"Lỗi không mong muốn trong quá trình quét", exc_info=True)
 
-    def _draw_highlight_rectangle(self, rect):
+
+    def _scan_parent_element(self):
+        self.logger.info("Yêu cầu quét phần tử cha từ F7.")
+        if not self.current_element:
+            self.logger.warning("Chưa có element nào được quét. Vui lòng nhấn F8 trước.")
+            return
+        
         try:
-            root = tk.Toplevel(self.root_gui)
-            root.overrideredirect(True)
-            root.wm_attributes("-topmost", True)
-            root.wm_attributes("-disabled", True)
-            root.wm_attributes("-transparentcolor", "white")
-            root.geometry(f'{rect[2]-rect[0]}x{rect[3]-rect[1]}+{rect[0]}+{rect[1]}')
-            canvas = tk.Canvas(root, bg='white', highlightthickness=0)
+            parent = self.tree_walker.GetParentElement(self.current_element)
+            if parent and parent.CurrentNativeWindowHandle != 0:
+                self.current_element = parent
+                self._inspect_element(self.current_element)
+            else:
+                self.logger.warning("Không tìm thấy phần tử cha hợp lệ.")
+        except Exception as e:
+            self.logger.error(f"Lỗi khi quét phần tử cha: {e}", exc_info=True)
+    
+    def _scan_child_element(self):
+        self.logger.info("Yêu cầu quét phần tử con từ F9.")
+        if not self.current_element:
+            self.logger.warning("Chưa có element nào được quét. Vui lòng nhấn F8 trước.")
+            return
+        
+        try:
+            cursor_pos = win32gui.GetCursorPos()
+            point = wintypes.POINT(cursor_pos[0], cursor_pos[1])
+            
+            child = self.tree_walker.GetFirstChildElement(self.current_element)
+            found_child = None
+            while child:
+                child_rect = child.CurrentBoundingRectangle
+                if (point.x >= child_rect.left and point.x <= child_rect.right and
+                    point.y >= child_rect.top and point.y <= child_rect.bottom):
+                    found_child = child
+                    break
+                child = self.tree_walker.GetNextSiblingElement(child)
+            
+            if found_child:
+                self.current_element = found_child
+                self._inspect_element(self.current_element)
+            else:
+                self.logger.warning("Không tìm thấy element con nào dưới con trỏ.")
+
+        except Exception as e:
+            self.logger.error(f"Lỗi khi quét phần tử con: {e}", exc_info=True)
+
+    def _inspect_element(self, element):
+        element_details = _get_element_details_comprehensive(element, self.tree_walker)
+        element_pid = element_details.get('proc_pid')
+        top_level_window_handle = self._find_main_window_from_pid(element_pid) if element_pid else 0
+        window_details = _get_window_details(top_level_window_handle, self.uia, self.tree_walker) if top_level_window_handle else {}
+        
+        coords = element_details.get('geo_bounding_rect_tuple')
+        if coords:
+            level = element_details.get('rel_level', 0)
+            self._draw_highlight_rectangle(coords, level)
+        
+        cleaned_element_details = _clean_element_spec(window_details, element_details)
+        self.root_gui.update_spec_dialog(window_details, cleaned_element_details)
+
+    def _draw_highlight_rectangle(self, rect, level=0):
+        try:
+            self.root_gui.destroy_highlight()
+            colors = ['#FF0000', '#FF7F00', '#FFFF00', '#00FF00', '#0000FF', '#4B0082', '#9400D3']
+            color = colors[level % len(colors)]
+
+            highlight_window = tk.Toplevel(self.root_gui)
+            highlight_window.overrideredirect(True)
+            highlight_window.wm_attributes("-topmost", True)
+            highlight_window.wm_attributes("-disabled", True)
+            highlight_window.wm_attributes("-transparentcolor", "white")
+            highlight_window.geometry(f'{rect[2]-rect[0]}x{rect[3]-rect[1]}+{rect[0]}+{rect[1]}')
+            canvas = tk.Canvas(highlight_window, bg='white', highlightthickness=0)
             canvas.pack(fill=tk.BOTH, expand=True)
-            canvas.create_rectangle(2, 2, rect[2]-rect[0]-2, rect[3]-rect[1]-2, outline='red', width=4)
-            root.after(1500, root.destroy)
+            canvas.create_rectangle(2, 2, rect[2]-rect[0]-2, rect[3]-rect[1]-2, outline=color, width=4)
+            self.root_gui.highlight_window = highlight_window
+            highlight_window.after(HIGHLIGHT_DURATION_MS, highlight_window.destroy)
         except Exception as e:
             self.logger.error(f"Lỗi khi vẽ hình chữ nhật: {e}")
 
@@ -324,6 +435,7 @@ class InspectorApp(tk.Tk):
         
         self.inspector = UIInspector(self)
         self.spec_dialog = None
+        self.highlight_window = None
         
         self.task_queue = queue.Queue()
 
@@ -331,6 +443,7 @@ class InspectorApp(tk.Tk):
         style.configure("TButton", padding=10, font=('Segoe UI', 12))
         style.configure("TLabel", padding=5, font=('Segoe UI', 10))
         style.configure("Header.TLabel", font=('Segoe UI', 16, 'bold'))
+        style.configure("Small.TButton", padding=1, font=('Segoe UI', 8))
         
         self.create_main_widgets()
 
@@ -344,7 +457,7 @@ class InspectorApp(tk.Tk):
         scan_excel_btn = ttk.Button(self.main_frame, text="Quét toàn bộ cửa sổ (ra Excel)", command=self.run_full_scan)
         scan_excel_btn.pack(fill="x", pady=5)
 
-        interactive_btn = ttk.Button(self.main_frame, text="Bắt đầu chế độ quét tương tác (F8)", command=self.run_interactive_scan)
+        interactive_btn = ttk.Button(self.main_frame, text="Bắt đầu chế độ quét tương tác", command=self.run_interactive_scan)
         interactive_btn.pack(fill="x", pady=5)
 
     def run_full_scan(self):
@@ -362,6 +475,8 @@ class InspectorApp(tk.Tk):
 
     def keyboard_listener_thread(self):
         keyboard.add_hotkey('f8', lambda: self.task_queue.put('scan'))
+        keyboard.add_hotkey('f7', lambda: self.task_queue.put('scan_parent'))
+        keyboard.add_hotkey('f9', lambda: self.task_queue.put('scan_child'))
         keyboard.wait('esc')
         self.task_queue.put('stop')
 
@@ -370,6 +485,10 @@ class InspectorApp(tk.Tk):
             task = self.task_queue.get_nowait()
             if task == 'scan':
                 self.inspector._run_scan_at_cursor()
+            elif task == 'scan_parent':
+                self.inspector._scan_parent_element()
+            elif task == 'scan_child':
+                self.inspector._scan_child_element()
             elif task == 'stop':
                 self.stop_interactive_scan()
                 return
@@ -383,62 +502,14 @@ class InspectorApp(tk.Tk):
         self.hide_spec_dialog()
         self.deiconify()
 
-    def show_countdown_timer(self, seconds):
-        timer_window = tk.Toplevel(self)
-        timer_window.title("Đang chờ...")
-        timer_window.geometry("300x100")
-        timer_window.wm_attributes("-topmost", 1)
-        timer_window.resizable(False, False)
-        
-        label = ttk.Label(timer_window, font=('Segoe UI', 14))
-        label.pack(pady=20, expand=True)
-
-        def update_timer(sec):
-            if sec > 0:
-                label.config(text=f"Bắt đầu quét sau: {sec} giây...")
-                self.after(1000, update_timer, sec - 1)
-            else:
-                timer_window.destroy()
-        
-        update_timer(seconds)
-        self.wait_window(timer_window)
-
-    def show_scan_result(self, file_path):
-        result_dialog = tk.Toplevel(self)
-        result_dialog.title("Quét hoàn tất")
-        result_dialog.geometry("600x200")
-        result_dialog.wm_attributes("-topmost", 1)
-
-        if file_path:
-            label_text = "Quét thành công! File đã được lưu tại:"
-            link_text = str(file_path)
-            
-            msg_label = ttk.Label(result_dialog, text=label_text, wraplength=580)
-            msg_label.pack(padx=10, pady=5)
-
-            link_label = ttk.Label(result_dialog, text=link_text, foreground="blue", cursor="hand2", wraplength=580)
-            link_label.pack(padx=10, pady=5)
-            link_font = font.Font(link_label, link_label.cget("font"))
-            link_font.configure(underline=True)
-            link_label.configure(font=link_font)
-            link_label.bind("<Button-1>", lambda e: os.startfile(file_path))
-        else:
-            msg_label = ttk.Label(result_dialog, text="Quét thất bại. Vui lòng xem log để biết chi tiết.")
-            msg_label.pack(padx=10, pady=20)
-
-        close_btn = ttk.Button(result_dialog, text="Đóng", command=result_dialog.destroy)
-        close_btn.pack(pady=10)
-        result_dialog.transient(self)
-        result_dialog.grab_set()
-
     def show_spec_dialog(self):
         if self.spec_dialog and self.spec_dialog.winfo_exists():
             self.spec_dialog.lift()
             return
             
         self.spec_dialog = tk.Toplevel(self)
-        self.spec_dialog.title("Kết quả quét tương tác (F8)")
-        self.spec_dialog.geometry("850x700")
+        self.spec_dialog.title("Kết quả quét tương tác")
+        self.spec_dialog.geometry(f"{INTERACTIVE_DIALOG_WIDTH}x{INTERACTIVE_DIALOG_HEIGHT}")
         self.spec_dialog.wm_attributes("-topmost", 1)
         self.spec_dialog.protocol("WM_DELETE_WINDOW", self.stop_interactive_scan)
 
@@ -446,40 +517,49 @@ class InspectorApp(tk.Tk):
             self.spec_dialog.clipboard_clear()
             self.spec_dialog.clipboard_append(content)
             self.spec_dialog.update()
-            button.config(text="Đã copy!")
+            button.config(text="Copied!")
             self.spec_dialog.after(1500, lambda: button.config(text="Copy"))
 
         main_frame = ttk.Frame(self.spec_dialog, padding=10)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1) # Sửa lỗi: Cho phép co giãn
+        main_frame.rowconfigure(1, weight=1) # Sửa lỗi: Cho phép co giãn
+        main_frame.rowconfigure(2, weight=1) # Sửa lỗi: Cho phép co giãn
 
         win_frame = ttk.LabelFrame(main_frame, text="Window Spec (Thông tin đầy đủ)", padding=10)
-        win_frame.grid(row=0, column=0, sticky="ew", pady=5)
+        win_frame.grid(row=0, column=0, sticky="nsew", pady=5)
         win_frame.columnconfigure(0, weight=1)
-        self.win_text = tk.Text(win_frame, height=8, wrap="word", font=("Courier New", 10))
+        win_frame.rowconfigure(0, weight=1)
+        self.win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10))
         self.win_text.grid(row=0, column=0, sticky="nsew")
-        win_copy_btn = ttk.Button(win_frame, text="Copy", command=lambda: copy_to_clipboard(self.win_text.get("1.0", "end-1c"), win_copy_btn))
+        win_copy_btn = ttk.Button(win_frame, text="Copy", style="Small.TButton", command=lambda: copy_to_clipboard(self.win_text.get("1.0", "end-1c"), win_copy_btn))
         win_copy_btn.grid(row=0, column=1, padx=5, sticky='n')
 
         elem_frame = ttk.LabelFrame(main_frame, text="Element Spec (Thông tin đầy đủ)", padding=10)
         elem_frame.grid(row=1, column=0, sticky="ew", pady=5)
         elem_frame.columnconfigure(0, weight=1)
-        self.elem_text = tk.Text(elem_frame, height=12, wrap="word", font=("Courier New", 10))
+        elem_frame.rowconfigure(0, weight=1)
+        self.elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10))
         self.elem_text.grid(row=0, column=0, sticky="nsew")
-        elem_copy_btn = ttk.Button(elem_frame, text="Copy", command=lambda: copy_to_clipboard(self.elem_text.get("1.0", "end-1c"), elem_copy_btn))
+        elem_copy_btn = ttk.Button(elem_frame, text="Copy", style="Small.TButton", command=lambda: copy_to_clipboard(self.elem_text.get("1.0", "end-1c"), elem_copy_btn))
         elem_copy_btn.grid(row=0, column=1, padx=5, sticky='n')
         
         quick_frame = ttk.LabelFrame(main_frame, text="Quick Spec (Gợi ý để copy nhanh)", padding=10)
         quick_frame.grid(row=2, column=0, sticky="ew", pady=5)
         quick_frame.columnconfigure(0, weight=1)
-        self.quick_text = tk.Text(quick_frame, height=8, wrap="word", font=("Courier New", 10))
+        quick_frame.rowconfigure(0, weight=1)
+        self.quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
         self.quick_text.grid(row=0, column=0, sticky="nsew")
-        quick_copy_btn = ttk.Button(quick_frame, text="Copy", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), quick_copy_btn))
+        quick_copy_btn = ttk.Button(quick_frame, text="Copy", style="Small.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), quick_copy_btn))
         quick_copy_btn.grid(row=0, column=1, padx=5, sticky='n')
 
     def update_spec_dialog(self, window_info, element_info):
         if not self.spec_dialog or not self.spec_dialog.winfo_exists():
             return
+        
+        level = element_info.get('rel_level', 0)
+        self.spec_dialog.title(f"Kết quả quét tương tác (Level: {level})")
             
         win_spec_str = f"window_spec = {_format_dict_as_pep8_string(window_info)}"
         self.win_text.config(state="normal")
@@ -498,6 +578,11 @@ class InspectorApp(tk.Tk):
         self.quick_text.delete("1.0", "end")
         self.quick_text.insert("1.0", quick_spec_str)
         self.quick_text.config(state="disabled")
+
+    def destroy_highlight(self):
+        if self.highlight_window and self.highlight_window.winfo_exists():
+            self.highlight_window.destroy()
+        self.highlight_window = None
 
     def hide_spec_dialog(self):
         if self.spec_dialog:
