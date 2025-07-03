@@ -74,50 +74,15 @@ class UIController:
         if self.human_interruption_detection:
             self._start_input_listener()
 
-    def wait_for_element_vanish(self, window_spec, element_spec=None, timeout=20):
-        """
-        Chờ đợi cho đến khi một element không còn tồn tại.
-
-        Args:
-            window_spec (dict): Bộ lọc để tìm cửa sổ.
-            element_spec (dict, optional): Bộ lọc để tìm element con.
-            timeout (int): Thời gian chờ tối đa (giây).
-
-        Returns:
-            bool: True nếu element đã biến mất, False nếu hết thời gian chờ.
-        """
-        self.logger.info(f"Bắt đầu chờ element biến mất (timeout={timeout}s)...")
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                # Dùng timeout=0 để không chờ, chỉ kiểm tra sự tồn tại ngay lập tức
-                self._find_target(window_spec, element_spec, timeout=0)
-                # Nếu không có lỗi, nghĩa là element vẫn còn đó, tiếp tục chờ
-                time.sleep(0.5)
-            except (WindowNotFoundError, ElementNotFoundError):
-                # Nếu không tìm thấy, nghĩa là element đã biến mất -> thành công
-                self.logger.info("-> Element đã biến mất.")
-                return True
-        
-        self.logger.warning(f"Hết thời gian chờ. Element vẫn còn tồn tại sau {timeout} giây.")
-        return False
-
-    def get_next_state(self, cases, timeout=20):
+    def get_next_state(self, cases, timeout=20, retry_interval=0.5):
         """
         Chờ đợi cho đến khi một trong nhiều trạng thái (cases) xảy ra.
-
-        Args:
-            cases (dict): Một dictionary trong đó mỗi key là tên của một "trường hợp",
-                          và value là một dictionary chứa 'window_spec' và 'element_spec' (tùy chọn).
-            timeout (int): Thời gian chờ tối đa (giây).
-
-        Returns:
-            str: Key của trường hợp đầu tiên được thỏa mãn, hoặc None nếu hết thời gian chờ.
         """
-        self.logger.info(f"Bắt đầu chờ một trong {len(cases)} trường hợp xảy ra (timeout={timeout}s)...")
+        self.logger.info(f"Bắt đầu chờ một trong {len(cases)} trường hợp xảy ra (timeout={timeout}s, interval={retry_interval}s)...")
         start_time = time.time()
         while time.time() - start_time < timeout:
             for case_name, specs in cases.items():
+                self.logger.debug(f"--- Đang kiểm tra trường hợp: '{case_name}' ---")
                 try:
                     window_spec = specs.get('window_spec')
                     element_spec = specs.get('element_spec')
@@ -126,35 +91,63 @@ class UIController:
                         self.logger.warning(f"Trường hợp '{case_name}' thiếu 'window_spec'. Bỏ qua.")
                         continue
                     
-                    # Dùng _find_target với timeout=0 để không chờ đợi, chỉ kiểm tra
-                    # Nó sẽ ném lỗi nếu không tìm thấy, và chúng ta sẽ bắt lỗi đó
-                    self._find_target(window_spec, element_spec, timeout=0)
+                    self.logger.debug(f"  [Window Spec]: {window_spec}")
                     
-                    # Nếu không có lỗi nào được ném ra, nghĩa là đã tìm thấy
-                    self.logger.info(f"-> Đã xác định trạng thái: '{case_name}'")
-                    return case_name
+                    filter_spec, _ = self._split_spec(window_spec)
+                    native_spec, custom_filters = self._split_pwa_native_spec(filter_spec)
+                    
+                    self.logger.debug(f"  Lọc thô với: {native_spec}")
+                    candidates = self.desktop.windows(**native_spec)
+                    
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        candidate_details = [f"'{c.window_text()}' (handle: {c.handle})" for c in candidates]
+                        self.logger.debug(f"  -> Tìm thấy {len(candidates)} ứng viên sau khi lọc thô: {candidate_details}")
+
+                    if not candidates:
+                        continue
+
+                    self.logger.debug(f"  Lọc tinh với: {custom_filters}")
+                    candidates = self._apply_filters(candidates, custom_filters)
+                    self.logger.debug(f"  -> Còn lại {len(candidates)} ứng viên sau khi lọc tinh.")
+                    
+                    if candidates:
+                        if not element_spec:
+                            self.logger.info(f"-> Đã xác định trạng thái: '{case_name}' (dựa trên window)")
+                            return case_name
+                        
+                        self.logger.debug(f"  Tìm thấy {len(candidates)} cửa sổ ứng viên. Bắt đầu kiểm tra element_spec...")
+                        self.logger.debug(f"  [Element Spec]: {element_spec}")
+
+                        for i, window in enumerate(candidates):
+                            self.logger.debug(f"    Kiểm tra bên trong cửa sổ ứng viên #{i+1}: '{window.window_text()}'")
+                            try:
+                                self._find_unique_element(element_spec, window.descendants, "Element", timeout=0)
+                                self.logger.info(f"-> Đã xác định trạng thái: '{case_name}' (dựa trên element trong cửa sổ '{window.window_text()}')")
+                                return case_name
+                            except (ElementNotFoundError, AmbiguousElementError) as e:
+                                self.logger.debug(f"      -> Không tìm thấy element khớp. Lỗi: {e}")
+                                continue
                 
-                except (WindowNotFoundError, AmbiguousElementError, ElementNotFoundError):
-                    # Đây là trường hợp bình thường, chỉ đơn giản là chưa tìm thấy
-                    # case này, tiếp tục tìm các case khác.
+                except Exception as e:
+                    self.logger.debug(f"  Lỗi khi kiểm tra trường hợp '{case_name}': {e}")
                     continue
             
-            time.sleep(0.5) # Chờ một chút trước khi quét lại
+            time.sleep(retry_interval)
         
         self.logger.warning(f"Hết thời gian chờ. Không có trường hợp nào xảy ra trong {timeout} giây.")
         return None
 
-    def select_element(self, window_spec, element_spec=None, timeout=10):
+    def select_element(self, window_spec, element_spec=None, timeout=10, retry_interval=0.5):
         self.logger.info("Bắt đầu tác vụ: select_element (Standalone)")
-        target_element = self._find_target(window_spec, element_spec, timeout)
+        target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
         self.logger.info(f"-> Lựa chọn THÀNH CÔNG. Đã tìm thấy: '{target_element.window_text()}'\n")
         return target_element
 
-    def run_action(self, window_spec, element_spec=None, action=None, timeout=10, auto_activate=False):
+    def run_action(self, window_spec, element_spec=None, action=None, timeout=10, auto_activate=False, retry_interval=0.5):
         self.logger.info(f"Bắt đầu tác vụ: run_action='{action or 'Find Only'}'")
         try:
             self._wait_for_user_idle()
-            target_element = self._find_target(window_spec, element_spec, timeout)
+            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
             if action:
                 command = action.split(':', 1)[0].lower().strip()
                 if command not in self.BACKGROUND_SAFE_ACTIONS:
@@ -172,14 +165,14 @@ class UIController:
             self.logger.error("--- TÁC VỤ THẤT BẠI ---\n")
             return False
 
-    def get_property(self, window_spec, element_spec=None, property_name=None, timeout=10):
+    def get_property(self, window_spec, element_spec=None, property_name=None, timeout=10, retry_interval=0.5):
         self.logger.info(f"Bắt đầu tác vụ: get_property='{property_name}'")
 
         if property_name not in self.GETTABLE_PROPERTIES:
             raise ValueError(f"Thuộc tính '{property_name}' không được hỗ trợ. Các thuộc tính hợp lệ là: {self.GETTABLE_PROPERTIES}")
 
         self._wait_for_user_idle()
-        target_element = self._find_target(window_spec, element_spec, timeout)
+        target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
         
         value = self._get_actual_value(target_element, property_name)
         
@@ -252,20 +245,20 @@ class UIController:
             with self._bot_acting_lock:
                 self._is_bot_acting = False
 
-    def _find_target(self, window_spec, element_spec=None, timeout=10):
+    def _find_target(self, window_spec, element_spec=None, timeout=10, retry_interval=0.5):
         start_time = time.time()
         last_error = ""
         while time.time() - start_time < timeout:
             try:
-                window = self._find_unique_element(window_spec, self.desktop.windows, "Window")
+                window = self._find_unique_element(window_spec, self.desktop.windows, "Window", timeout)
                 if not element_spec:
                     return window
-                return self._find_unique_element(element_spec, window.descendants, "Element")
+                return self._find_unique_element(element_spec, window.descendants, "Element", timeout)
             except (ElementNotFoundError, AmbiguousElementError) as e:
                 if isinstance(e, AmbiguousElementError):
                     raise e
                 last_error = str(e)
-                time.sleep(0.5)
+                time.sleep(retry_interval)
         raise WindowNotFoundError(f"Không thể tìm thấy mục tiêu sau {timeout} giây. Lỗi cuối cùng: {last_error}")
 
     def _handle_activation(self, target_element, command, timeout, auto_activate):
@@ -309,7 +302,7 @@ class UIController:
                     time.sleep(0.5)
                 raise UIActionError(f"Hết thời gian chờ. Cửa sổ không được kích hoạt trong {timeout} giây.")
 
-    def _find_unique_element(self, spec, find_func, search_type):
+    def _find_unique_element(self, spec, find_func, search_type, timeout=10):
         filter_spec, selector_spec = self._split_spec(spec)
         native_spec, custom_filters = self._split_pwa_native_spec(filter_spec)
         
@@ -318,6 +311,10 @@ class UIController:
         
         candidates = self._apply_filters(candidates, custom_filters)
         if not candidates: raise ElementNotFoundError(f"[{search_type}] Lọc tinh thất bại với: {custom_filters}")
+        
+        if len(candidates) > 1 and not selector_spec:
+            self.logger.debug(f"Tìm thấy nhiều ứng viên và không có bộ chọn. Mặc định chọn cái mới nhất.")
+            selector_spec['sort_by_creation_time'] = -1
         
         candidates = self._apply_selectors(candidates, selector_spec)
         
@@ -350,6 +347,12 @@ class UIController:
 
     def _element_matches_spec(self, elem, spec):
         for key, criteria in spec.items():
+            # SỬA LỖI: Xử lý control type dạng số ngay tại đây
+            if key == 'pwa_control_type' and isinstance(criteria, int):
+                if elem.element_info.control_id != criteria:
+                    return False
+                continue # Nếu khớp, chuyển sang key tiếp theo
+
             actual_value = self._get_actual_value(elem, key)
             if not self._check_condition(actual_value, criteria):
                 return False
