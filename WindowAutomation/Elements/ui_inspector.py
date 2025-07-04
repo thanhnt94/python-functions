@@ -227,6 +227,7 @@ class UIInspector:
 
     def scan_window_to_excel(self, wait_time=3):
         self.logger.info(f"Vui lòng chuyển sang cửa sổ muốn quét. Bắt đầu sau {wait_time} giây...")
+        # SỬA LỖI: Gọi hàm đếm ngược đã được định nghĩa trong InspectorApp
         self.root_gui.show_countdown_timer(wait_time)
         
         active_hwnd = win32gui.GetForegroundWindow()
@@ -502,6 +503,82 @@ class InspectorApp(tk.Tk):
         self.hide_spec_dialog()
         self.deiconify()
 
+    # SỬA LỖI: Thêm phương thức show_countdown_timer
+    def show_countdown_timer(self, duration):
+        """Hiển thị một cửa sổ đếm ngược blocking để chờ người dùng."""
+        countdown_win = tk.Toplevel(self)
+        countdown_win.title("Đang đếm ngược")
+        countdown_win.overrideredirect(True)
+        countdown_win.wm_attributes("-topmost", True)
+        
+        style = ttk.Style(countdown_win)
+        style.configure("Countdown.TLabel", font=('Segoe UI', 16, 'bold'), padding=25)
+        
+        label = ttk.Label(countdown_win, text=f"Bắt đầu sau {duration} giây...", style="Countdown.TLabel")
+        label.pack()
+        
+        # Căn giữa cửa sổ đếm ngược
+        countdown_win.update_idletasks()
+        width = countdown_win.winfo_width()
+        height = countdown_win.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        countdown_win.geometry(f'{width}x{height}+{x}+{y}')
+        
+        # Vòng lặp đếm ngược mà vẫn cập nhật giao diện
+        for i in range(duration, 0, -1):
+            label.config(text=f"Bắt đầu quét trong {i}...")
+            self.update() # Xử lý các sự kiện của giao diện
+            time.sleep(1)
+            
+        countdown_win.destroy()
+
+    # SỬA LỖI: Thêm phương thức show_scan_result
+    def show_scan_result(self, file_path):
+        """Hiển thị kết quả sau khi quét xong trong một dialog."""
+        result_win = tk.Toplevel(self)
+        result_win.title("Kết quả quét")
+        result_win.transient(self) # Gắn dialog với cửa sổ chính
+        result_win.grab_set() # Chặn tương tác với các cửa sổ khác
+
+        if file_path and os.path.exists(file_path):
+            message = f"Quét thành công!\n\nKết quả đã được lưu tại:\n{file_path}"
+        else:
+            message = "Quét thất bại.\nVui lòng kiểm tra log để biết thêm chi tiết."
+            
+        label = ttk.Label(result_win, text=message, padding=20, wraplength=450, justify='center')
+        label.pack(pady=10, padx=10, fill='x')
+        
+        def open_folder():
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.startfile(os.path.dirname(file_path))
+                except Exception as e:
+                    logging.error(f"Không thể mở thư mục: {e}")
+            result_win.destroy()
+
+        def close_win():
+            result_win.destroy()
+
+        button_frame = ttk.Frame(result_win)
+        button_frame.pack(pady=10)
+
+        if file_path and os.path.exists(file_path):
+            open_btn = ttk.Button(button_frame, text="Mở thư mục", command=open_folder)
+            open_btn.pack(side='left', padx=10)
+
+        ok_btn = ttk.Button(button_frame, text="OK", command=close_win)
+        ok_btn.pack(side='left', padx=10)
+
+        # Căn giữa dialog
+        result_win.update_idletasks()
+        width = result_win.winfo_width()
+        height = result_win.winfo_height()
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        result_win.geometry(f'{width}x{height}+{x}+{y}')
+
+
     def show_spec_dialog(self):
         if self.spec_dialog and self.spec_dialog.winfo_exists():
             self.spec_dialog.lift()
@@ -523,9 +600,9 @@ class InspectorApp(tk.Tk):
         main_frame = ttk.Frame(self.spec_dialog, padding=10)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(0, weight=1) # Sửa lỗi: Cho phép co giãn
-        main_frame.rowconfigure(1, weight=1) # Sửa lỗi: Cho phép co giãn
-        main_frame.rowconfigure(2, weight=1) # Sửa lỗi: Cho phép co giãn
+        main_frame.rowconfigure(0, weight=1) 
+        main_frame.rowconfigure(1, weight=1) 
+        main_frame.rowconfigure(2, weight=1) 
 
         win_frame = ttk.LabelFrame(main_frame, text="Window Spec (Thông tin đầy đủ)", padding=10)
         win_frame.grid(row=0, column=0, sticky="nsew", pady=5)
