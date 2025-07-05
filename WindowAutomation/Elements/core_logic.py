@@ -1,6 +1,6 @@
 # core_logic.py
-# Contains the core, shared logic for property retrieval and element finding.
-# Added helper functions for spec creation and cleaning.
+# Contains the core, shared logic and ALL definitions for the suite.
+# This is the single source of truth for parameters, operators, and actions.
 
 import logging
 import re
@@ -71,6 +71,40 @@ PARAMETER_DEFINITIONS = {
     "uia_table_row_headers": "The headers of the row if it supports TableItemPattern.",
 }
 
+# --- Operator Definitions ---
+STRING_OPERATORS = {'equals', 'iequals', 'contains', 'icontains', 'in', 'regex',
+                    'not_equals', 'not_iequals', 'not_contains', 'not_icontains'}
+NUMERIC_OPERATORS = {'>', '>=', '<', '<='}
+OPERATOR_DEFINITIONS = [
+    {'category': 'String', 'name': 'equals', 'example': "'pwa_title': ('equals', 'File Explorer')", 'desc': "Matches the exact string (case-sensitive)."},
+    {'category': 'String', 'name': 'iequals', 'example': "'pwa_title': ('iequals', 'file explorer')", 'desc': "Matches the exact string (case-insensitive)."},
+    {'category': 'String', 'name': 'contains', 'example': "'pwa_title': ('contains', 'Explorer')", 'desc': "Checks if the string contains the substring (case-sensitive)."},
+    {'category': 'String', 'name': 'icontains', 'example': "'pwa_title': ('icontains', 'explorer')", 'desc': "Checks if the string contains the substring (case-insensitive)."},
+    {'category': 'String', 'name': 'in', 'example': "'proc_name': ('in', ['explorer.exe', 'notepad.exe'])", 'desc': "Checks if the value is in a list of strings."},
+    {'category': 'String', 'name': 'regex', 'example': "'pwa_title': ('regex', r'File.*')", 'desc': "Matches using a regular expression."},
+    {'category': 'String', 'name': 'not_equals', 'example': "'pwa_title': ('not_equals', 'Calculator')", 'desc': "Value is not exactly equal."},
+    {'category': 'String', 'name': 'not_icontains', 'example': "'pwa_class_name': ('not_icontains', 'Chrome')", 'desc': "Value does not contain the substring (case-insensitive)."},
+    {'category': 'Numeric', 'name': '>', 'example': "'rel_child_count': ('>', 5)", 'desc': "Greater than."},
+    {'category': 'Numeric', 'name': '>=', 'example': "'rel_child_count': ('>=', 5)", 'desc': "Greater than or equal to."},
+    {'category': 'Numeric', 'name': '<', 'example': "'win32_handle': ('<', 100000)", 'desc': "Less than."},
+    {'category': 'Numeric', 'name': '<=', 'example': "'rel_level': ('<=', 3)", 'desc': "Less than or equal to."},
+]
+
+# --- Action Definitions ---
+ACTION_DEFINITIONS = [
+    {'category': 'Mouse', 'name': 'click', 'example': "action='click'", 'desc': "Performs a standard left-click."},
+    {'category': 'Mouse', 'name': 'double_click', 'example': "action='double_click'", 'desc': "Performs a double left-click."},
+    {'category': 'Mouse', 'name': 'right_click', 'example': "action='right_click'", 'desc': "Performs a right-click."},
+    {'category': 'Keyboard', 'name': 'type_keys', 'example': "action='type_keys:Hello World!{ENTER}'", 'desc': "Types a string of text. Supports special keys like {ENTER}, {TAB}, etc."},
+    {'category': 'Keyboard', 'name': 'set_text', 'example': "action='set_text:New text value'", 'desc': "Sets the text of an edit control directly. Faster than typing."},
+    {'category': 'Keyboard', 'name': 'paste_text', 'example': "action='paste_text:Text from clipboard'", 'desc': "Pastes text from the clipboard (Ctrl+V)."},
+    {'category': 'Keyboard', 'name': 'send_message_text', 'example': "action='send_message_text:Background text'", 'desc': "Sets text using Windows messages. Works even if window is not active."},
+    {'category': 'State', 'name': 'focus', 'example': "action='focus'", 'desc': "Sets the keyboard focus to the element."},
+    {'category': 'State', 'name': 'invoke', 'example': "action='invoke'", 'desc': "Invokes the default action of an element (like pressing a button)."},
+    {'category': 'State', 'name': 'toggle', 'example': "action='toggle'", 'desc': "Toggles the state of a checkbox or toggle button."},
+    {'category': 'State', 'name': 'select', 'example': "action='select:Item Name'", 'desc': "Selects an item in a list box, combo box, or tab control by its name."},
+]
+
 # --- Property Sets ---
 PWA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('pwa_')}
 WIN32_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('win32_')}
@@ -83,9 +117,6 @@ UIA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('uia_')}
 # --- Selectors and Operators ---
 SORTING_KEYS = {'sort_by_creation_time', 'sort_by_title_length', 'sort_by_child_count',
                 'sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height', 'z_order_index'}
-STRING_OPERATORS = {'equals', 'iequals', 'contains', 'icontains', 'in', 'regex',
-                    'not_equals', 'not_iequals', 'not_contains', 'not_icontains'}
-NUMERIC_OPERATORS = {'>', '>=', '<', '<='}
 VALID_OPERATORS = STRING_OPERATORS.union(NUMERIC_OPERATORS)
 
 # Set of all supported filter keys
@@ -116,7 +147,7 @@ def format_spec_to_string(spec_dict, spec_name="spec"):
     content = "\n".join(items_str)
     return f"{spec_name} = {{\n{content}\n}}"
 
-def create_smart_quick_spec(info, spec_type='window'):
+def create_smart_quick_spec(info, spec_type='window', as_dict=False):
     """Creates an intelligent, minimal, and reliable quick spec."""
     spec = {}
     if spec_type == 'window':
@@ -131,6 +162,9 @@ def create_smart_quick_spec(info, spec_type='window'):
         elif info.get('pwa_class_name'):
             spec['pwa_class_name'] = info['pwa_class_name']
             if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
+    
+    if as_dict:
+        return spec
     return format_spec_to_string(spec, f"{spec_type}_spec")
 
 def clean_element_spec(window_info, element_info):

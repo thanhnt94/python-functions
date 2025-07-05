@@ -1,6 +1,6 @@
 # tool_scanner.py
 # A standalone tool for interactive UI element inspection using hotkeys.
-# Renamed from ui_interactive_scan.py.
+# Refactored to be launchable from the main suite and send specs to the debugger.
 
 import logging
 import re
@@ -9,7 +9,7 @@ import os
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk, font
+from tkinter import ttk, font, messagebox
 from ctypes import wintypes
 
 # --- Required Libraries ---
@@ -23,7 +23,6 @@ try:
     from pywinauto.controls.uiawrapper import UIAWrapper
 except ImportError as e:
     print(f"Error importing libraries: {e}")
-    print("Suggestion: pip install pywin32 comtypes keyboard pywinauto")
     sys.exit(1)
 
 # --- Shared Logic Import ---
@@ -38,7 +37,7 @@ except ImportError:
 # ======================================================================
 
 HIGHLIGHT_DURATION_MS = 2500
-DIALOG_WIDTH = 350 
+DIALOG_WIDTH = 300 
 DIALOG_HEIGHT = 700
 DIALOG_DEFAULT_GEOMETRY = "-10-10" 
 
@@ -146,15 +145,22 @@ class InteractiveScannerLogic:
             self.logger.warning("Could not get element coordinates to draw highlight.")
 
         cleaned_element_details = core_logic.clean_element_spec(window_details, element_details)
-        self.root_gui.update_spec_dialog(window_details, cleaned_element_details)
+        self.root_gui.update_spec_dialog(window_details, element_details, cleaned_element_details)
 
 # ======================================================================
 #                      GUI CLASS
 # ======================================================================
 
-class ScannerApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
+class ScannerApp(tk.Toplevel):
+    def __init__(self, suite_app=None):
+        # We need a root window to host this Toplevel, even if it's hidden.
+        # If suite_app is provided, it's the root. Otherwise, create a dummy hidden root.
+        root = suite_app if suite_app else tk.Tk()
+        if not suite_app:
+            root.withdraw() # Hide the dummy root in standalone mode
+        
+        super().__init__(root)
+        self.suite_app = suite_app
         
         self.title("Interactive Scan Results")
         self.geometry(f"{DIALOG_WIDTH}x{DIALOG_HEIGHT}{DIALOG_DEFAULT_GEOMETRY}")
@@ -165,16 +171,19 @@ class ScannerApp(tk.Tk):
         self.highlight_window = None
         self.listener_thread = None
         
+        # To store the latest scanned info
+        self.last_window_info = {}
+        self.last_element_info = {}
+        self.last_cleaned_element_info = {}
+        
         self.create_spec_dialog_widgets()
         self.run_interactive_scan()
 
     def run_interactive_scan(self):
-        """Starts the hotkey listener."""
         self.listener_thread = threading.Thread(target=self.keyboard_listener_thread, daemon=True)
         self.listener_thread.start()
 
     def keyboard_listener_thread(self):
-        """Listens for F7, F8, F9, and ESC keys."""
         logging.info("Starting hotkey listener: F7 (Parent), F8 (Scan), F9 (Child), ESC (Exit).")
         keyboard.add_hotkey('f8', lambda: self.after(0, self.scanner._run_scan_at_cursor))
         keyboard.add_hotkey('f7', lambda: self.after(0, self.scanner._scan_parent_element))
@@ -183,14 +192,12 @@ class ScannerApp(tk.Tk):
         self.after(0, self.on_closing)
 
     def on_closing(self):
-        """Handles the application shutdown."""
         logging.info("Exit command received, shutting down scanner.")
         keyboard.unhook_all()
         self.destroy_highlight()
         self.destroy()
 
     def create_spec_dialog_widgets(self):
-        """Creates and configures the widgets directly on the main window."""
         style = ttk.Style(self)
         style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
         
@@ -204,7 +211,12 @@ class ScannerApp(tk.Tk):
             self.clipboard_clear(); self.clipboard_append(content); self.update()
             original_text = button.cget("text"); button.config(text="✅")
             self.after(1500, lambda: button.config(text=original_text))
-            
+        
+        def send_specs(win_spec, elem_spec):
+            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
+                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
+                self.on_closing()
+
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
@@ -222,6 +234,9 @@ class ScannerApp(tk.Tk):
         self.copy_full_win_btn.pack(side='left', padx=2)
         self.copy_quick_win_btn = ttk.Button(win_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_win_spec_str, self.copy_quick_win_btn))
         self.copy_quick_win_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            send_win_btn = ttk.Button(win_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, {}))
+            send_win_btn.pack(side='left', padx=2)
 
         # --- Element Spec Frame ---
         elem_frame = ttk.LabelFrame(main_frame, text="Element Specification", padding=(10, 5))
@@ -235,6 +250,9 @@ class ScannerApp(tk.Tk):
         self.copy_full_elem_btn.pack(side='left', padx=2)
         self.copy_quick_elem_btn = ttk.Button(elem_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_elem_spec_str, self.copy_quick_elem_btn))
         self.copy_quick_elem_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            send_elem_btn = ttk.Button(elem_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, self.last_cleaned_element_info))
+            send_elem_btn.pack(side='left', padx=2)
 
         # --- Combined Quick Spec Frame ---
         quick_frame = ttk.LabelFrame(main_frame, text="Combined Quick Spec", padding=(10, 5))
@@ -246,40 +264,46 @@ class ScannerApp(tk.Tk):
         quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
         self.copy_combined_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), self.copy_combined_quick_btn))
         self.copy_combined_quick_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.quick_win_spec_dict, self.quick_elem_spec_dict))
+            send_quick_btn.pack(side='left', padx=2)
 
-    def update_spec_dialog(self, window_info, element_info):
-        """Updates the content of the main window (acting as the spec dialog)."""
+    def update_spec_dialog(self, window_info, element_info, cleaned_element_info):
         if not self.winfo_exists(): return
+        
+        self.last_window_info = window_info
+        self.last_element_info = element_info
+        self.last_cleaned_element_info = cleaned_element_info
+        
+        self.quick_win_spec_dict = core_logic.create_smart_quick_spec(window_info, 'window', as_dict=True)
+        self.quick_elem_spec_dict = core_logic.create_smart_quick_spec(cleaned_element_info, 'element', as_dict=True)
+        
+        self.quick_win_spec_str = core_logic.format_spec_to_string(self.quick_win_spec_dict, 'window_spec')
+        self.quick_elem_spec_str = core_logic.format_spec_to_string(self.quick_elem_spec_dict, 'element_spec')
         
         level = element_info.get('rel_level', 'N/A')
         proc_name = window_info.get('proc_name', 'Unknown')
         self.status_label.config(text=f"Level: {level} | Process: {proc_name}")
 
-        self.quick_win_spec_str = core_logic.create_smart_quick_spec(window_info, 'window')
-        self.quick_elem_spec_str = core_logic.create_smart_quick_spec(element_info, 'element')
-
         win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
         self.win_text.config(state="normal"); self.win_text.delete("1.0", "end"); self.win_text.insert("1.0", win_spec_str); self.win_text.config(state="disabled")
         
-        elem_spec_str = core_logic.format_spec_to_string(core_logic.clean_element_spec(window_info, element_info), "element_spec")
+        elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
         self.elem_text.config(state="normal"); self.elem_text.delete("1.0", "end"); self.elem_text.insert("1.0", elem_spec_str); self.elem_text.config(state="disabled")
         
         combined_quick_spec_str = f"{self.quick_win_spec_str}\n\n{self.quick_elem_spec_str}"
         self.quick_text.config(state="normal"); self.quick_text.delete("1.0", "end"); self.quick_text.insert("1.0", combined_quick_spec_str); self.quick_text.config(state="disabled")
         
     def destroy_highlight(self):
-        """Safely destroys the highlight window if it exists."""
         if self.highlight_window and self.highlight_window.winfo_exists():
             self.highlight_window.destroy()
         self.highlight_window = None
 
     def draw_highlight(self, rect, level=0):
-        """Draws a highlight rectangle on the screen."""
         self.destroy_highlight()
         try:
             colors = ['#FF0000', '#FF7F00', '#FFFF00', '#00FF00', '#0000FF', '#4B0082', '#9400D3']
             color = colors[level % len(colors)]
-
             self.highlight_window = tk.Toplevel(self)
             self.highlight_window.overrideredirect(True)
             self.highlight_window.wm_attributes("-topmost", True, "-disabled", True, "-transparentcolor", "white")
@@ -298,5 +322,5 @@ class ScannerApp(tk.Tk):
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
     
-    app = ScannerApp()
+    app = ScannerApp(suite_app=None)
     app.mainloop()

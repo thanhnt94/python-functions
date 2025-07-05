@@ -1,6 +1,6 @@
 # tool_debugger.py
 # A standalone and embeddable tool for testing and debugging selectors.
-# Final fix for the detail window layout to resolve blank window issue and restore button styles.
+# Final version with all layout and import fixes, and spec receiving logic.
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, font, messagebox
@@ -81,9 +81,11 @@ class SelectorDebugger:
 #                      GUI CLASS (Embeddable Frame)
 # ======================================================================
 class DebuggerTab(ttk.Frame):
-    def __init__(self, parent, status_label_widget):
+    def __init__(self, parent, suite_app=None, status_label_widget=None):
         super().__init__(parent)
         self.pack(fill="both", expand=True)
+        self.suite_app = suite_app
+        self.status_label = status_label_widget or getattr(suite_app, 'status_label', None)
 
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -93,7 +95,6 @@ class DebuggerTab(ttk.Frame):
         style.configure("Treeview.Heading", font=('Segoe UI', 10, 'bold'))
         style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
 
-        self.status_label = status_label_widget
         self.highlighter = None
         self.test_thread = None
         self.found_items_map = {}
@@ -305,6 +306,11 @@ class DebuggerTab(ttk.Frame):
         element_info = self.debugger.get_element_details(element_pwa)
         cleaned_element_info = core_logic.clean_element_spec(window_info, element_info)
         
+        def send_specs(win_spec, elem_spec):
+            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
+                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
+                detail_win.destroy()
+        
         def copy_to_clipboard(content, button):
             detail_win.clipboard_clear(); detail_win.clipboard_append(content); detail_win.update()
             original_text = button.cget("text"); button.config(text="✅")
@@ -317,54 +323,62 @@ class DebuggerTab(ttk.Frame):
         
         # --- Window Spec Frame ---
         win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
-        quick_win_spec_str = core_logic.create_smart_quick_spec(window_info, 'window')
         win_frame = ttk.LabelFrame(main_frame, text="Window Specification", padding=(10, 5))
         win_frame.grid(row=0, column=0, sticky="nsew", pady=5)
-        win_frame.columnconfigure(0, weight=1); win_frame.rowconfigure(0, weight=1)
-        
+        win_frame.columnconfigure(0, weight=1); win_frame.rowconfigure(1, weight=1)
         win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10))
-        win_text.grid(row=0, column=0, sticky="nsew") # Text area uses grid
+        win_text.grid(row=1, column=0, sticky="nsew")
         win_text.insert("1.0", win_spec_str); win_text.config(state="disabled")
-        
         win_btn_frame = ttk.Frame(win_frame)
-        win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne') # Use place for the button frame
-        copy_full_win_btn = ttk.Button(win_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(win_spec_str, copy_full_win_btn))
+        win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        copy_full_win_btn = ttk.Button(win_btn_frame, text="📋 Copy", style="Copy.TButton", command=lambda: copy_to_clipboard(win_spec_str, copy_full_win_btn))
         copy_full_win_btn.pack(side='left', padx=2)
-        copy_quick_win_btn = ttk.Button(win_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_win_spec_str, copy_quick_win_btn))
-        copy_quick_win_btn.pack(side='left', padx=2)
-
+        
         # --- Element Spec Frame ---
         elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
-        quick_elem_spec_str = core_logic.create_smart_quick_spec(cleaned_element_info, 'element')
         elem_frame = ttk.LabelFrame(main_frame, text="Element Specification (duplicates removed)", padding=(10, 5))
         elem_frame.grid(row=1, column=0, sticky="nsew", pady=5)
-        elem_frame.columnconfigure(0, weight=1); elem_frame.rowconfigure(0, weight=1)
-        
+        elem_frame.columnconfigure(0, weight=1); elem_frame.rowconfigure(1, weight=1)
         elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10))
-        elem_text.grid(row=0, column=0, sticky="nsew")
+        elem_text.grid(row=1, column=0, sticky="nsew")
         elem_text.insert("1.0", elem_spec_str); elem_text.config(state="disabled")
-        
         elem_btn_frame = ttk.Frame(elem_frame)
         elem_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_full_elem_btn = ttk.Button(elem_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(elem_spec_str, copy_full_elem_btn))
+        copy_full_elem_btn = ttk.Button(elem_btn_frame, text="📋 Copy", style="Copy.TButton", command=lambda: copy_to_clipboard(elem_spec_str, copy_full_elem_btn))
         copy_full_elem_btn.pack(side='left', padx=2)
-        copy_quick_elem_btn = ttk.Button(elem_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_elem_spec_str, copy_quick_elem_btn))
-        copy_quick_elem_btn.pack(side='left', padx=2)
 
-        # --- Combined Spec Frame ---
-        combined_quick_spec_str = f"{quick_win_spec_str}\n\n{quick_elem_spec_str}"
-        quick_frame = ttk.LabelFrame(main_frame, text="Combined Quick Spec", padding=(10, 5))
-        quick_frame.grid(row=2, column=0, sticky="nsew", pady=5)
-        quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
+        # --- Bottom Action Frame ---
+        if self.suite_app:
+            action_frame = ttk.Frame(main_frame, padding=(0, 10, 0, 0))
+            action_frame.grid(row=2, column=0, sticky='ew')
+            action_frame.columnconfigure(1, weight=1) # Make space between buttons
+
+            quick_win_spec_dict = core_logic.create_smart_quick_spec(window_info, 'window', as_dict=True)
+            quick_elem_spec_dict = core_logic.create_smart_quick_spec(cleaned_element_info, 'element', as_dict=True)
+
+            send_quick_btn = ttk.Button(action_frame, text="🚀 Send Quick Specs to Debugger", 
+                                        command=lambda: send_specs(quick_win_spec_dict, quick_elem_spec_dict))
+            send_quick_btn.grid(row=0, column=0, sticky='w')
+
+            send_full_btn = ttk.Button(action_frame, text="🚀 Send Full Specs to Debugger", 
+                                       command=lambda: send_specs(window_info, cleaned_element_info))
+            send_full_btn.grid(row=0, column=2, sticky='e')
+
+    def receive_specs(self, window_spec, element_spec):
+        """Receives specs from other tools and populates the text boxes."""
+        self.clear_log()
+        win_spec_str = core_logic.format_spec_to_string(window_spec, "window_spec")
+        elem_spec_str = core_logic.format_spec_to_string(element_spec, "element_spec")
         
-        quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
-        quick_text.grid(row=0, column=0, sticky="nsew")
-        quick_text.insert("1.0", combined_quick_spec_str); quick_text.config(state="disabled")
+        self.window_spec_text.config(state="normal")
+        self.window_spec_text.delete("1.0", "end")
+        self.window_spec_text.insert("1.0", win_spec_str)
         
-        quick_btn_frame = ttk.Frame(quick_frame)
-        quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_combined_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(combined_quick_spec_str, copy_combined_quick_btn))
-        copy_combined_quick_btn.pack(side='left', padx=2)
+        self.element_spec_text.config(state="normal")
+        self.element_spec_text.delete("1.0", "end")
+        self.element_spec_text.insert("1.0", elem_spec_str)
+        
+        self.log_message("INFO", "Received specs from another tool.")
 
 # ======================================================================
 #                           ENTRY POINT (for standalone execution)
@@ -382,6 +396,6 @@ if __name__ == '__main__':
     status_label = ttk.Label(status_frame, text="Ready (Standalone Mode)")
     status_label.pack(side='left', padx=5)
 
-    app_frame = DebuggerTab(root, status_label)
+    app_frame = DebuggerTab(root, status_label_widget=status_label)
     
     root.mainloop()
