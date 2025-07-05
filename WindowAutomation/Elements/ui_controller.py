@@ -1,65 +1,55 @@
 # Elements/ui_controller.py
-# Phiên bản 20.1: Sửa lỗi import để có thể chạy trực tiếp.
-# Hỗ trợ đầy đủ các thuộc tính từ ui_inspector, bao gồm cả UIA patterns.
+# Phiên bản 21.1: Thêm khởi tạo COM để cung cấp cho ElementFinder.
 
 import logging
-import re
 import time
-import math
 import threading
-from datetime import datetime
 
 # --- Thư viện cần thiết ---
 try:
-    import psutil
-    import win32gui
-    import win32process
-    import win32con
     import win32api
+    import win32con
     import pyperclip
     from pynput import mouse, keyboard
     from pywinauto.findwindows import ElementNotFoundError
     from pywinauto import Desktop
+    # *** FIX: Thêm import để khởi tạo COM ***
     import comtypes
     from comtypes.gen import UIAutomationClient as UIA
 except ImportError as e:
     print(f"Lỗi import thư viện, vui lòng cài đặt: {e}")
+    print("Gợi ý: pip install pynput pywinauto pyperclip comtypes")
     exit()
 
 # --- Cấu hình logging ---
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
 
-# --- Định nghĩa Exception tùy chỉnh ---
-class UIActionError(Exception): pass
-class WindowNotFoundError(UIActionError): pass
-class AmbiguousElementError(UIActionError): pass
-
-# --- Import các thành phần dùng chung (Đã sửa lỗi) ---
+# --- Import các thành phần đã tái cấu trúc từ thư mục Elements ---
 try:
-    # Cách import này dùng khi chạy file như một phần của package lớn hơn
     from . import ui_shared_logic
     from .ui_notify import StatusNotifier
 except ImportError:
-    # Cách import này dùng khi chạy file ui_controller.py trực tiếp
     import ui_shared_logic
     try:
         from ui_notify import StatusNotifier
     except ImportError:
-        StatusNotifier = None # Cho phép chạy mà không cần ui_notify
+        StatusNotifier = None
+
+# --- Định nghĩa Exception tùy chỉnh ---
+class UIActionError(Exception): pass
+class WindowNotFoundError(UIActionError): pass
+class ElementNotFoundFromWindowError(UIActionError): pass
+class AmbiguousElementError(UIActionError): pass
 
 def create_notifier_callback(notifier_instance):
-    if not isinstance(notifier_instance, StatusNotifier):
-        return None
-    
+    if not isinstance(notifier_instance, StatusNotifier): return None
     def event_handler(event_type, message, **kwargs):
         notifier_instance.update_status(
-            text=message,
-            style=event_type,
-            duration=kwargs.get('duration')
+            text=message, style=event_type, duration=kwargs.get('duration')
         )
     return event_handler
 
@@ -76,48 +66,25 @@ DEFAULT_CONTROLLER_CONFIG = {
 }
 
 class UIController:
-    # ======================================================================
-    #                      BỘ TỪ KHÓA VÀ THAM SỐ HỢP LỆ
-    # ======================================================================
-    SUPPORTED_KEYS = ui_shared_logic.SUPPORTED_FILTER_KEYS
-
-    GETTABLE_PROPERTIES = {'text', 'texts', 'value', 'is_toggled'}.union(SUPPORTED_KEYS)
+    GETTABLE_PROPERTIES = {'text', 'texts', 'value', 'is_toggled'}.union(ui_shared_logic.SUPPORTED_FILTER_KEYS)
     BACKGROUND_SAFE_ACTIONS = {'set_text', 'send_message_text'}
     SENSITIVE_ACTIONS = {'paste_text', 'type_keys', 'set_text'}
-    SORTING_KEYS = {'sort_by_creation_time', 'sort_by_title_length', 'sort_by_child_count',
-                    'sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height', 'z_order_index'}
-    
-    STRING_OPERATORS = {'equals', 'iequals', 'contains', 'icontains', 'in', 'regex',
-                        'not_equals', 'not_iequals', 'not_contains', 'not_icontains'}
-    NUMERIC_OPERATORS = {'>', '>=', '<', '<='}
-    VALID_OPERATORS = STRING_OPERATORS.union(NUMERIC_OPERATORS)
     VALID_ACTIONS = {'click', 'double_click', 'right_click', 'focus', 'invoke', 'toggle',
                      'select', 'set_text', 'paste_text', 'type_keys', 'send_message_text'}
 
-    # ======================================================================
-    #                           KHỞI TẠO VÀ CÁC HÀM CHÍNH
-    # ======================================================================
-
     def __init__(self, notifier=None, event_callback=None, **kwargs):
         self.logger = logging.getLogger(self.__class__.__name__)
+        if event_callback: self.event_callback = event_callback
+        elif notifier and StatusNotifier: self.event_callback = create_notifier_callback(notifier)
+        else: self.event_callback = None
         
-        if event_callback:
-            self.event_callback = event_callback
-        elif notifier and StatusNotifier:
-            self.event_callback = create_notifier_callback(notifier)
-        else:
-            self.event_callback = None
-        
-        self.backend = kwargs.get('backend', DEFAULT_CONTROLLER_CONFIG['backend'])
-        self.human_interruption_detection = kwargs.get('human_interruption_detection', DEFAULT_CONTROLLER_CONFIG['human_interruption_detection'])
-        self.human_cooldown_period = kwargs.get('human_cooldown_period', DEFAULT_CONTROLLER_CONFIG['human_cooldown_period'])
-        self.secure_mode = kwargs.get('secure_mode', DEFAULT_CONTROLLER_CONFIG['secure_mode'])
-        
-        self.desktop = Desktop(backend=self.backend)
-        self._last_human_activity_time = time.time() - self.human_cooldown_period
+        self.config = {**DEFAULT_CONTROLLER_CONFIG, **kwargs}
+        self.desktop = Desktop(backend=self.config['backend'])
+        self._last_human_activity_time = time.time() - self.config['human_cooldown_period']
         self._is_bot_acting = False
         self._bot_acting_lock = threading.Lock()
         
+        # *** FIX: Khởi tạo các đối tượng COM cần thiết ***
         try:
             self.uia = comtypes.client.CreateObject(UIA.CUIAutomation)
             self.tree_walker = self.uia.ControlViewWalker
@@ -125,272 +92,135 @@ class UIController:
             self.logger.critical(f"Lỗi nghiêm trọng khi khởi tạo COM: {e}", exc_info=True)
             raise
         
-        if self.human_interruption_detection:
+        # *** FIX: Truyền các đối tượng COM vào ElementFinder ***
+        self.finder = ui_shared_logic.ElementFinder(
+            uia_instance=self.uia,
+            tree_walker=self.tree_walker,
+            log_callback=self._internal_log
+        )
+        
+        if self.config['human_interruption_detection']:
             self._start_input_listener()
+
+    def _internal_log(self, level, message):
+        self.logger.debug(f"[ElementFinder] {message}")
 
     def _emit_event(self, event_type, message, **kwargs):
         log_levels = {"info": logging.INFO, "success": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR, "process": logging.DEBUG, "debug": logging.DEBUG}
         self.logger.log(log_levels.get(event_type, logging.INFO), message)
-
         if self.event_callback and callable(self.event_callback):
-            try:
-                self.event_callback(event_type, message, **kwargs)
-            except Exception as e:
-                self.logger.error(f"Lỗi khi thực thi event_callback: {e}")
+            try: self.event_callback(event_type, message, **kwargs)
+            except Exception as e: self.logger.error(f"Lỗi khi thực thi event_callback: {e}")
 
     def close(self):
         self.logger.info("Đóng UIController...")
             
     def get_next_state(self, cases, timeout=None, retry_interval=None, description=None, notify_style='info'):
-        timeout = timeout if timeout is not None else DEFAULT_CONTROLLER_CONFIG['default_timeout']
-        retry_interval = retry_interval if retry_interval is not None else DEFAULT_CONTROLLER_CONFIG['default_retry_interval']
-        
+        timeout = timeout if timeout is not None else self.config['default_timeout']
+        retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         display_message = description or f"Chờ 1 trong {len(cases)} trạng thái"
         self._emit_event(notify_style if description else 'info', display_message)
-        
         start_time = time.time()
         while time.time() - start_time < timeout:
             self._wait_for_user_idle()
-
             for case_name, specs in cases.items():
                 self.logger.debug(f"--- Bắt đầu kiểm tra trường hợp: '{case_name}' ---")
                 try:
                     self._find_target(specs.get('window_spec'), specs.get('element_spec'), timeout=0)
                     self._emit_event('success', f"Thành công: '{display_message}' -> Trạng thái '{case_name}'")
                     return case_name
-                except (WindowNotFoundError, ElementNotFoundError, AmbiguousElementError) as e:
+                except (WindowNotFoundError, ElementNotFoundFromWindowError, AmbiguousElementError) as e:
                     self.logger.debug(f"Case '{case_name}' không khớp. Lý do: {e}")
                     continue
             time.sleep(retry_interval)
-        
         self._emit_event('warning', f"Hết thời gian chờ: '{display_message}'")
         return None
 
     def run_action(self, window_spec, element_spec=None, action=None, timeout=None, auto_activate=False, retry_interval=None, description=None, notify_style='info'):
-        timeout = timeout if timeout is not None else DEFAULT_CONTROLLER_CONFIG['default_timeout']
-        retry_interval = retry_interval if retry_interval is not None else DEFAULT_CONTROLLER_CONFIG['default_retry_interval']
-        
+        timeout = timeout if timeout is not None else self.config['default_timeout']
+        retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         log_action = action
-        if self.secure_mode and action and ':' in action:
+        if self.config['secure_mode'] and action and ':' in action:
             command, _ = action.split(':', 1)
             if command.lower().strip() in self.SENSITIVE_ACTIONS:
                 log_action = f"{command}:********"
-        
         display_message = description or f"Thực thi tác vụ: {log_action or 'Find Only'}"
         verbose = description is None
-
         self._emit_event(notify_style if description else 'info', display_message)
-        
         try:
             self._wait_for_user_idle()
-            
-            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval, verbose=verbose)
-
+            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
             if action:
                 command = action.split(':', 1)[0].lower().strip()
                 if command not in self.BACKGROUND_SAFE_ACTIONS:
-                    self._handle_activation(target_element, command, timeout, auto_activate, verbose=verbose)
-                
+                    self._handle_activation(target_element, command, auto_activate)
                 if verbose: self._emit_event('process', f"Đang thực thi hành động '{log_action}'...")
                 self._execute_action_safely(target_element, action)
-            
+            self._emit_event('success', f"Thành công: {display_message}")
             return True
-        except Exception as e:
+        except (UIActionError, WindowNotFoundError, ElementNotFoundFromWindowError, AmbiguousElementError) as e:
             self.logger.error(f"Lỗi khi thực hiện '{display_message}': {e}", exc_info=True)
+            self._emit_event('error', f"Thất bại: {display_message}")
+            return False
+        except Exception as e:
+            self.logger.critical(f"Lỗi không mong muốn khi thực hiện '{display_message}': {e}", exc_info=True)
             self._emit_event('error', f"Thất bại: {display_message}")
             return False
 
     def get_property(self, window_spec, element_spec=None, property_name=None, timeout=None, retry_interval=None, description=None, notify_style='info'):
-        timeout = timeout if timeout is not None else DEFAULT_CONTROLLER_CONFIG['default_timeout']
-        retry_interval = retry_interval if retry_interval is not None else DEFAULT_CONTROLLER_CONFIG['default_retry_interval']
-        
+        timeout = timeout if timeout is not None else self.config['default_timeout']
+        retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         display_message = description or f"Lấy thuộc tính '{property_name}'"
-        verbose = description is None
         self._emit_event(notify_style if description else 'info', display_message)
-
         if property_name not in self.GETTABLE_PROPERTIES:
             raise ValueError(f"Thuộc tính '{property_name}' không được hỗ trợ.")
-
         try:
             self._wait_for_user_idle()
-            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval, verbose=verbose)
-            value = self._get_actual_value(target_element, property_name)
+            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
+            value = ui_shared_logic.get_property_value(target_element, property_name, self.uia, self.tree_walker)
+            self._emit_event('success', f"Lấy thuộc tính '{property_name}' thành công.")
             return value
-        except Exception as e:
+        except (UIActionError, WindowNotFoundError, ElementNotFoundFromWindowError, AmbiguousElementError) as e:
             self.logger.error(f"Lỗi khi thực hiện '{display_message}': {e}", exc_info=True)
             self._emit_event('error', f"Thất bại: {display_message}")
             return None
+        except Exception as e:
+            self.logger.critical(f"Lỗi không mong muốn khi thực hiện '{display_message}': {e}", exc_info=True)
+            self._emit_event('error', f"Thất bại: {display_message}")
+            return None
 
-    # ======================================================================
-    #                           CÁC HÀM NỘI BỘ (Đã tái cấu trúc)
-    # ======================================================================
-    
-    def _find_unique_element(self, spec, find_func, search_type):
-        filter_spec, selector_spec = self._split_spec(spec)
-        native_spec, custom_filters = self._split_pwa_native_spec(filter_spec)
-        
-        self.logger.debug(f"[{search_type}] Bắt đầu lọc thô với spec: {native_spec}")
-        candidates = find_func(**native_spec)
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Lọc thô thất bại, không tìm thấy ứng viên nào với: {native_spec}")
-        
-        self.logger.debug(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên sau lọc thô.")
-
-        self.logger.debug(f"[{search_type}] Bắt đầu lọc tinh với spec: {custom_filters}")
-        candidates = self._apply_filters(candidates, custom_filters)
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Lọc tinh thất bại, không còn ứng viên nào sau khi áp dụng: {custom_filters}")
-        
-        self.logger.debug(f"[{search_type}] Còn lại {len(candidates)} ứng viên sau lọc tinh.")
-
-        if selector_spec:
-            self.logger.debug(f"[{search_type}] Bắt đầu lựa chọn với spec: {selector_spec}")
-            candidates = self._apply_selectors(candidates, selector_spec)
-        
-        if len(candidates) > 1:
-            details = [f"'{c.window_text()}' (pid: {c.process_id()})" for c in candidates[:5]]
-            raise AmbiguousElementError(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên không rõ ràng. Vui lòng cung cấp thêm bộ chọn. Chi tiết: {details}")
-        if not candidates:
-            raise ElementNotFoundError(f"[{search_type}] Không còn ứng viên nào sau khi lựa chọn.")
-        
-        self.logger.debug(f"[{search_type}] Đã chọn được ứng viên duy nhất.")
-        return candidates[0]
-
-    def _find_target(self, window_spec, element_spec=None, timeout=10, retry_interval=0.5, verbose=True):
+    def _find_target(self, window_spec, element_spec=None, timeout=10, retry_interval=0.5):
         start_time = time.time()
         last_error = ""
-        
-        if verbose: self.logger.debug(f"Bắt đầu tìm kiếm mục tiêu. Window Spec: {window_spec}, Element Spec: {element_spec}")
-
         while True:
-            try:
-                window = self._find_unique_element(window_spec, self.desktop.windows, "Window")
-                if verbose: self.logger.debug(f"Tìm thấy cửa sổ phù hợp: '{window.window_text()}' (Handle: {window.handle})")
-                
-                if not element_spec:
-                    return window
-                
-                if verbose: self.logger.debug(f"Bắt đầu tìm element bên trong cửa sổ '{window.window_text()}'...")
-                element = self._find_unique_element(element_spec, window.descendants, "Element")
-                if verbose: self.logger.debug(f"Tìm thấy element phù hợp: '{element.window_text()}'")
-                return element
-
-            except (ElementNotFoundError, AmbiguousElementError) as e:
-                last_error = str(e)
-                if isinstance(e, AmbiguousElementError):
-                    raise e
-                
-                if time.time() - start_time >= timeout:
-                    break
-                
-                time.sleep(retry_interval)
-        
-        raise WindowNotFoundError(f"Không thể tìm thấy mục tiêu sau {timeout} giây. Lỗi cuối cùng: {last_error}")
-
-    def _apply_filters(self, elements, spec):
-        if not spec: return elements
-        return [elem for elem in elements if self._element_matches_spec(elem, spec)]
-
-    def _element_matches_spec(self, elem, spec):
-        for key, criteria in spec.items():
-            actual_value = self._get_actual_value(elem, key)
-            if not self._check_condition(actual_value, criteria):
-                return False
-        return True
-
-    def _check_condition(self, actual_value, criteria):
-        if not isinstance(criteria, tuple):
-            return actual_value == criteria
-        if len(criteria) != 2:
-            self.logger.warning(f"Cú pháp bộ lọc không hợp lệ: {criteria}. Bỏ qua.")
-            return False
-        
-        operator, target_value = criteria
-        op = str(operator).lower()
-        if op not in self.VALID_OPERATORS:
-            self.logger.warning(f"Toán tử không được hỗ trợ: '{op}'. Bỏ qua.")
-            return False
-        
-        if actual_value is None: return False
-        
-        if op in self.STRING_OPERATORS:
-            str_actual = str(actual_value)
-            if op == 'equals': return str_actual == target_value
-            if op == 'iequals': return str_actual.lower() == str(target_value).lower()
-            if op == 'contains': return str(target_value) in str_actual
-            if op == 'icontains': return str(target_value).lower() in str_actual.lower()
-            if op == 'in': return str_actual in target_value
-            if op == 'regex': return re.search(str(target_value), str_actual) is not None
-            if op == 'not_equals': return str_actual != target_value
-            if op == 'not_iequals': return str_actual.lower() != str(target_value).lower()
-            if op == 'not_contains': return str(target_value) not in str_actual
-            if op == 'not_icontains': return str(target_value).lower() not in str_actual.lower()
-
-        if op in self.NUMERIC_OPERATORS:
-            try:
-                num_actual, num_target = float(actual_value), float(target_value)
-                if op == '>': return num_actual > num_target
-                if op == '>=': return num_actual >= num_target
-                if op == '<': return num_actual < num_target
-                if op == '<=': return num_actual <= num_target
-            except (ValueError, TypeError): return False
-            
-        return False
-
-    def _apply_selectors(self, candidates, selectors):
-        if not selectors: return candidates
-        sorted_candidates = list(candidates)
-        for key, index in selectors.items():
-            if key == 'z_order_index': continue
-            sort_key_func = self._get_sort_key_function(key)
-            if sort_key_func:
-                reverse_order = (index < 0)
-                sorted_candidates.sort(key=sort_key_func, reverse=reverse_order)
-        final_index = 0
-        if 'z_order_index' in selectors:
-            final_index = selectors['z_order_index']
-        elif selectors:
-            last_selector_key = list(selectors.keys())[-1]
-            final_index = selectors[last_selector_key]
-            final_index = final_index - 1 if final_index > 0 else final_index
-        try:
-            return [sorted_candidates[final_index]]
-        except IndexError:
-            raise ElementNotFoundError(f"Lựa chọn index={final_index} nằm ngoài phạm vi.")
-        
-    def _get_sort_key_function(self, key):
-        if key == 'sort_by_creation_time':
-            return lambda e: self._get_actual_value(e, 'proc_create_time') or datetime.min
-        if key == 'sort_by_title_length':
-            return lambda e: len(self._get_actual_value(e, 'pwa_title') or '')
-        if key == 'sort_by_child_count':
-            return lambda e: self._get_actual_value(e, 'rel_child_count') or 0
-        if key in ['sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height']:
-            def get_rect_prop(elem, prop_key):
-                rect = self._get_actual_value(elem, 'geo_bounding_rect_tuple')
-                if not rect: return 0
-                if prop_key == 'sort_by_y_pos': return rect[1]
-                if prop_key == 'sort_by_x_pos': return rect[0]
-                if prop_key == 'sort_by_width': return rect[2] - rect[0]
-                if prop_key == 'sort_by_height': return rect[3] - rect[1]
-            return lambda e: get_rect_prop(e, key)
-        return None
-
-    def _get_actual_value(self, element, key):
-        if key.lower() in {'text', 'texts'}:
-            try:
-                if key.lower() == 'text': return element.window_text()
-                if key.lower() == 'texts': return element.texts()
-            except Exception as e:
-                self.logger.debug(f"Lỗi khi lấy thuộc tính pywinauto '{key}': {e}")
-                return None
-
-        return ui_shared_logic.get_property_value(
-            pwa_element=element,
-            key=key,
-            uia_instance=self.uia,
-            tree_walker=self.tree_walker
-        )
+            windows = self.finder.find(lambda: self.desktop.windows(), window_spec)
+            if len(windows) == 1:
+                window = windows[0]
+                self.logger.debug(f"Tìm thấy cửa sổ phù hợp: '{window.window_text()}' (Handle: {window.handle})")
+                if not element_spec: return window
+                elements = self.finder.find(lambda: window.descendants(), element_spec)
+                if len(elements) == 1:
+                    element = elements[0]
+                    self.logger.debug(f"Tìm thấy element phù hợp: '{element.window_text()}'")
+                    return element
+                elif len(elements) > 1:
+                    details = [f"'{c.window_text()}'" for c in elements[:5]]
+                    raise AmbiguousElementError(f"Tìm thấy {len(elements)} elements không rõ ràng bên trong cửa sổ. Chi tiết: {details}")
+                else:
+                    last_error = f"Không tìm thấy element nào khớp với spec bên trong cửa sổ '{window.window_text()}'."
+            elif len(windows) > 1:
+                details = [f"'{c.window_text()}'" for c in windows[:5]]
+                raise AmbiguousElementError(f"Tìm thấy {len(windows)} cửa sổ không rõ ràng. Chi tiết: {details}")
+            else:
+                last_error = "Không tìm thấy cửa sổ nào khớp với spec."
+            if time.time() - start_time >= timeout:
+                if not element_spec and not windows:
+                    raise WindowNotFoundError(f"Hết thời gian chờ. {last_error}")
+                if element_spec and not elements:
+                    raise ElementNotFoundFromWindowError(f"Hết thời gian chờ. {last_error}")
+                break
+            time.sleep(retry_interval)
+        raise UIActionError(f"Không thể tìm thấy mục tiêu sau {timeout} giây. Lỗi cuối cùng: {last_error}")
 
     def _execute_action(self, element, action_str):
         self.logger.debug(f"Thực thi hành động '{action_str}' trên element '{element.window_text()}'")
@@ -400,7 +230,6 @@ class UIController:
         try:
             if command not in self.VALID_ACTIONS:
                 raise ValueError(f"Hành động '{command}' không được hỗ trợ.")
-            
             if command == 'click': element.click_input()
             elif command == 'double_click': element.double_click_input()
             elif command == 'right_click': element.right_click_input()
@@ -421,26 +250,11 @@ class UIController:
                     win32api.SendMessage(element.handle, win32con.WM_SETTEXT, 0, value)
         except Exception as e:
             raise UIActionError(f"Thực thi hành động '{action_str}' thất bại. Lỗi gốc: {type(e).__name__} - {e}") from e
-
-    def _split_spec(self, spec):
-        filter_spec = {k: v for k, v in spec.items() if k not in self.SORTING_KEYS}
-        selector_spec = {k: v for k, v in spec.items() if k in self.SORTING_KEYS}
-        return filter_spec, selector_spec
-
-    def _split_pwa_native_spec(self, spec):
-        native_spec, custom_filters = {}, {}
-        native_keys = { 'pwa_title': 'title', 'pwa_class_name': 'class_name', 'win32_handle': 'handle', 'proc_pid': 'process' }
-        for key, value in spec.items():
-            if key in native_keys and not isinstance(value, tuple):
-                native_spec[native_keys[key]] = value
-            else:
-                custom_filters[key] = value
-        return native_spec, custom_filters
         
     def _wait_for_user_idle(self):
-        if not self.human_interruption_detection: return
+        if not self.config['human_interruption_detection']: return
         is_paused = False
-        while time.time() - self._last_human_activity_time < self.human_cooldown_period:
+        while time.time() - self._last_human_activity_time < self.config['human_cooldown_period']:
             if not is_paused:
                 self._emit_event('warning', "Phát hiện người dùng! Tạm dừng...")
                 is_paused = True
@@ -448,11 +262,11 @@ class UIController:
         if is_paused:
             self._emit_event('success', "Người dùng đã ngừng. Tiếp tục thực thi...", duration=3)
 
-    def _handle_activation(self, target_element, command, timeout, auto_activate, verbose=True):
-        top_window = target_element.top_level_parent()
-        if not top_window.is_active():
+    def _handle_activation(self, target_element, command, auto_activate):
+        top_window = ui_shared_logic.get_top_level_window(target_element)
+        if top_window and not top_window.is_active():
             if auto_activate:
-                if verbose: self._emit_event('info', f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
+                self._emit_event('info', f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
                 if top_window.is_minimized(): top_window.restore()
                 top_window.set_focus()
                 time.sleep(0.5)
