@@ -1,5 +1,6 @@
-# functions/automation_panel.py
-# Module độc lập để tạo và quản lý bảng điều khiển tự động hóa.
+# ui_control_panel.py
+# A standalone module to create and manage an automation control panel.
+# Renamed from automation_panel.py.
 
 import tkinter as tk
 import threading
@@ -7,11 +8,11 @@ import logging
 
 class AutomationState:
     """
-    Một lớp an toàn để quản lý và chia sẻ trạng thái của tiến trình tự động hóa.
-    Sử dụng lock để đảm bảo an toàn khi truy cập từ nhiều luồng.
+    A thread-safe class to manage and share the state of the automation process.
+    Uses a lock to ensure safety when accessed from multiple threads.
     """
     def __init__(self):
-        self._status = "running"  # Trạng thái ban đầu
+        self._status = "running"  # Initial state
         self._lock = threading.Lock()
 
     @property
@@ -23,7 +24,7 @@ class AutomationState:
         with self._lock:
             if self._status == "running":
                 self._status = "paused"
-                logging.info("Trạng thái tự động hóa đã chuyển thành PAUSED.")
+                logging.info("Automation state changed to PAUSED.")
                 return True
         return False
 
@@ -31,14 +32,14 @@ class AutomationState:
         with self._lock:
             if self._status == "paused":
                 self._status = "running"
-                logging.info("Trạng thái tự động hóa đã chuyển thành RUNNING.")
+                logging.info("Automation state changed to RUNNING.")
                 return True
         return False
 
     def stop(self):
         with self._lock:
             self._status = "stopped"
-            logging.info("Trạng thái tự động hóa đã chuyển thành STOPPED.")
+            logging.info("Automation state changed to STOPPED.")
 
     def is_stopped(self):
         with self._lock:
@@ -51,16 +52,16 @@ class AutomationState:
 
 class AutomationControlPanel:
     """
-    Tạo một cửa sổ nhỏ, cố định trên màn hình với các nút Pause, Resume, Stop.
+    Creates a small, always-on-top window with Pause, Resume, and Stop buttons.
     """
     def __init__(self, automation_state, notifier_instance=None):
         """
         Args:
-            automation_state (AutomationState): Đối tượng để chia sẻ trạng thái.
-            notifier_instance: (Tùy chọn) Đối tượng StatusNotifier để hiển thị thông báo.
+            automation_state (AutomationState): The object to share state.
+            notifier_instance: (Optional) A StatusNotifier instance to display messages.
         """
         if not isinstance(automation_state, AutomationState):
-            raise TypeError("automation_state phải là một đối tượng của lớp AutomationState.")
+            raise TypeError("automation_state must be an instance of the AutomationState class.")
             
         self.state = automation_state
         self.notifier = notifier_instance
@@ -72,10 +73,10 @@ class AutomationControlPanel:
     def _run_gui(self):
         self.root = tk.Tk()
         self.root.title("Ctrl")
-        self.root.geometry("160x55+10+10") # Vị trí góc trên bên trái
+        self.root.geometry("160x55+10+10") # Position in the top-left corner
         self.root.wm_attributes("-topmost", True)
         self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self._stop_automation) # Dừng nếu đóng cửa sổ
+        self.root.protocol("WM_DELETE_WINDOW", self._stop_automation) # Stop if the window is closed
 
         button_frame = tk.Frame(self.root)
         button_frame.pack(pady=10, padx=10, fill='x', expand=True)
@@ -93,28 +94,30 @@ class AutomationControlPanel:
             if self.state.pause():
                 self.pause_button.config(text="▶️ Resume")
                 if self.notifier:
-                    self.notifier.update_status("Đã tạm dừng bởi người dùng.", style='warning', duration=0)
+                    self.notifier.update_status("Paused by user.", style='warning', duration=0)
         elif self.state.status == 'paused':
             if self.state.resume():
                 self.pause_button.config(text="⏸️ Pause")
                 if self.notifier:
-                    self.notifier.update_status("Tiếp tục thực thi...", style='success', duration=3)
+                    self.notifier.update_status("Resuming execution...", style='success', duration=3)
 
     def _stop_automation(self):
         self.state.stop()
         if self.notifier:
-            self.notifier.update_status("Tác vụ đã bị dừng hẳn!", style='error', duration=0)
+            self.notifier.update_status("Task has been stopped!", style='error', duration=0)
         try:
             self.pause_button.config(state='disabled')
+            # Disable the stop button as well
             for widget in self.pause_button.master.winfo_children():
-                if 'Stop' in widget.cget('text'):
+                if isinstance(widget, tk.Button) and 'Stop' in widget.cget('text'):
                     widget.config(state='disabled')
+            # Close the window after a short delay
             self.root.after(2000, self.root.destroy)
         except tk.TclError:
+            # This can happen if the window is already destroyed
             pass
 
     def close(self):
-        """Đóng cửa sổ điều khiển từ bên ngoài."""
+        """Closes the control panel window from an external call."""
         if self.root and self.root.winfo_exists():
             self.root.destroy()
-

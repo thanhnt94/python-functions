@@ -1,5 +1,6 @@
-# functions/ui_notify.py
-# Module độc lập để hiển thị các thông báo tạm thời trên màn hình.
+# ui_notifier.py
+# A standalone module for displaying temporary, on-screen notifications.
+# Renamed from ui_notify.py.
 
 import tkinter as tk
 from tkinter import font
@@ -8,7 +9,7 @@ import threading
 import time
 
 # ======================================================================
-#                      CẤU HÌNH MẶC ĐỊNH
+#                      DEFAULT CONFIGURATION
 # ======================================================================
 DEFAULT_NOTIFIER_CONFIG = {
     'theme': 'dark',
@@ -38,7 +39,7 @@ DEFAULT_NOTIFIER_CONFIG = {
 
 class StatusNotifier:
     """
-    Quản lý một cửa sổ thông báo đa năng, có thể tùy chỉnh cao.
+    Manages a versatile and highly customizable notification window.
     """
     def __init__(self, config=None):
         self.queue = queue.Queue()

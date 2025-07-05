@@ -1,5 +1,6 @@
-# Elements/ui_shared_logic.py
-# Version 1.2: Added a public spec formatter function.
+# core_logic.py
+# Contains the core, shared logic for property retrieval and element finding.
+# Added helper functions for spec creation and cleaning.
 
 import logging
 import re
@@ -20,57 +21,57 @@ except ImportError as e:
     print("Suggestion: pip install psutil pywin32 comtypes pywinauto")
     exit()
 
-# Khởi tạo logger cho module này
+# Initialize logger for this module
 logger = logging.getLogger(__name__)
 
 # ======================================================================
-#                      BỘ ĐỊNH NGHĨA TRUNG TÂM
+#                      CENTRAL DEFINITIONS
 # ======================================================================
 
-# --- Định nghĩa thuộc tính ---
+# --- Property Definitions ---
 PARAMETER_DEFINITIONS = {
-    "pwa_title": "Tên/văn bản hiển thị của element (quan trọng nhất).",
-    "pwa_auto_id": "Automation ID, một ID duy nhất để xác định element trong ứng dụng.",
-    "pwa_control_type": "Loại control của element (ví dụ: Button, Edit, Tree).",
-    "pwa_class_name": "Tên lớp Win32 của element (hữu ích cho các app cũ).",
-    "pwa_framework_id": "Framework tạo ra element (ví dụ: UIA, Win32, WPF).",
-    "win32_handle": "Handle (ID duy nhất) của cửa sổ do Windows quản lý.",
-    "win32_styles": "Các cờ kiểu dáng của cửa sổ (dạng hexa).",
-    "win32_extended_styles": "Các cờ kiểu dáng mở rộng của cửa sổ (dạng hexa).",
-    "state_is_visible": "Trạng thái hiển thị (True nếu đang hiển thị).",
-    "state_is_enabled": "Trạng thái cho phép tương tác (True nếu được kích hoạt).",
-    "state_is_active": "Trạng thái hoạt động (True nếu là cửa sổ/element đang được focus).",
-    "state_is_minimized": "Trạng thái thu nhỏ (True nếu cửa sổ đang bị thu nhỏ).",
-    "state_is_maximized": "Trạng thái phóng to (True nếu cửa sổ đang được phóng to).",
-    "state_is_focusable": "Trạng thái có thể nhận focus bàn phím.",
-    "state_is_password": "Trạng thái là ô nhập mật khẩu.",
-    "state_is_offscreen": "Trạng thái nằm ngoài màn hình hiển thị.",
-    "state_is_content_element": "Là element chứa nội dung chính, không phải control trang trí.",
-    "state_is_control_element": "Là element có thể tương tác (ngược với content).",
-    "geo_bounding_rect_tuple": "Tuple tọa độ (Left, Top, Right, Bottom) của element.",
-    "geo_center_point": "Tọa độ điểm trung tâm của element.",
-    "proc_pid": "Process ID (ID của tiến trình sở hữu cửa sổ).",
-    "proc_thread_id": "Thread ID (ID của luồng sở hữu cửa sổ).",
-    "proc_name": "Tên của tiến trình (ví dụ: 'notepad.exe').",
-    "proc_path": "Đường dẫn đầy đủ đến file thực thi của tiến trình.",
-    "proc_cmdline": "Dòng lệnh đã dùng để khởi chạy tiến trình.",
-    "proc_create_time": "Thời gian tiến trình được tạo (dạng timestamp hoặc chuỗi).",
-    "proc_username": "Tên người dùng đã khởi chạy tiến trình.",
-    "rel_level": "Cấp độ sâu của element trong cây giao diện (0 là root).",
-    "rel_parent_handle": "Handle của cửa sổ cha (nếu có, 0 là Desktop).",
-    "rel_parent_title": "Tên/tiêu đề của element cha.",
-    "rel_labeled_by": "Tên của element nhãn (label) liên kết với element này.",
-    "rel_child_count": "Số lượng element con trực tiếp.",
-    "uia_value": "Giá trị của element nếu hỗ trợ ValuePattern.",
-    "uia_toggle_state": "Trạng thái của element nếu hỗ trợ TogglePattern (On, Off, Indeterminate).",
-    "uia_expand_state": "Trạng thái nếu hỗ trợ ExpandCollapsePattern (Collapsed, Expanded, LeafNode).",
-    "uia_selection_items": "Các item đang được chọn nếu hỗ trợ SelectionPattern.",
-    "uia_range_value_info": "Thông tin (Min, Max, Value) nếu hỗ trợ RangeValuePattern.",
-    "uia_grid_cell_info": "Thông tin (Row, Col, RowSpan, ColSpan) nếu hỗ trợ GridItemPattern.",
-    "uia_table_row_headers": "Tiêu đề của hàng nếu hỗ trợ TableItemPattern.",
+    "pwa_title": "The visible text/name of the element (most important).",
+    "pwa_auto_id": "Automation ID, a unique identifier for the element within the application.",
+    "pwa_control_type": "The control type of the element (e.g., Button, Edit, Tree).",
+    "pwa_class_name": "The Win32 class name of the element (useful for legacy apps).",
+    "pwa_framework_id": "The framework that created the element (e.g., UIA, Win32, WPF).",
+    "win32_handle": "The handle (unique ID) of the window managed by Windows.",
+    "win32_styles": "The style flags of the window (in hex).",
+    "win32_extended_styles": "The extended style flags of the window (in hex).",
+    "state_is_visible": "Visibility state (True if visible).",
+    "state_is_enabled": "Interaction state (True if enabled).",
+    "state_is_active": "Active state (True if it is the focused window/element).",
+    "state_is_minimized": "Minimized state (True if the window is minimized).",
+    "state_is_maximized": "Maximized state (True if the window is maximized).",
+    "state_is_focusable": "Focusable state (True if it can receive keyboard focus).",
+    "state_is_password": "Password field state (True if it is a password input).",
+    "state_is_offscreen": "Off-screen state (True if it is outside the visible screen area).",
+    "state_is_content_element": "Is a content element, not just a decorative control.",
+    "state_is_control_element": "Is an interactable control element (opposite of content).",
+    "geo_bounding_rect_tuple": "The coordinate tuple (Left, Top, Right, Bottom) of the element.",
+    "geo_center_point": "The center point coordinates of the element.",
+    "proc_pid": "Process ID (ID of the process that owns the window).",
+    "proc_thread_id": "Thread ID (ID of the thread that owns the window).",
+    "proc_name": "The name of the process (e.g., 'notepad.exe').",
+    "proc_path": "The full path to the process's executable file.",
+    "proc_cmdline": "The command line used to launch the process.",
+    "proc_create_time": "The creation time of the process (as a timestamp or string).",
+    "proc_username": "The username that launched the process.",
+    "rel_level": "The depth level of the element in the UI tree (0 is the root).",
+    "rel_parent_handle": "The handle of the parent window (if any, 0 is the Desktop).",
+    "rel_parent_title": "The name/title of the parent element.",
+    "rel_labeled_by": "The name of the label element associated with this element.",
+    "rel_child_count": "The number of direct child elements.",
+    "uia_value": "The value of the element if it supports ValuePattern.",
+    "uia_toggle_state": "The state of the element if it supports TogglePattern (On, Off, Indeterminate).",
+    "uia_expand_state": "The state if it supports ExpandCollapsePattern (Collapsed, Expanded, LeafNode).",
+    "uia_selection_items": "The currently selected items if it supports SelectionPattern.",
+    "uia_range_value_info": "Information (Min, Max, Value) if it supports RangeValuePattern.",
+    "uia_grid_cell_info": "Information (Row, Col, RowSpan, ColSpan) if it supports GridItemPattern.",
+    "uia_table_row_headers": "The headers of the row if it supports TableItemPattern.",
 }
 
-# --- Phân loại các bộ thuộc tính ---
+# --- Property Sets ---
 PWA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('pwa_')}
 WIN32_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('win32_')}
 STATE_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('state_')}
@@ -79,7 +80,7 @@ PROC_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('proc_')}
 REL_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('rel_')}
 UIA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('uia_')}
 
-# --- Định nghĩa các bộ chọn (Selectors) và toán tử (Operators) ---
+# --- Selectors and Operators ---
 SORTING_KEYS = {'sort_by_creation_time', 'sort_by_title_length', 'sort_by_child_count',
                 'sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height', 'z_order_index'}
 STRING_OPERATORS = {'equals', 'iequals', 'contains', 'icontains', 'in', 'regex',
@@ -87,13 +88,13 @@ STRING_OPERATORS = {'equals', 'iequals', 'contains', 'icontains', 'in', 'regex',
 NUMERIC_OPERATORS = {'>', '>=', '<', '<='}
 VALID_OPERATORS = STRING_OPERATORS.union(NUMERIC_OPERATORS)
 
-# Tập hợp tất cả các key được hỗ trợ để lọc
+# Set of all supported filter keys
 SUPPORTED_FILTER_KEYS = PWA_PROPS | WIN32_PROPS | STATE_PROPS | GEO_PROPS | PROC_PROPS | REL_PROPS | UIA_PROPS
 
-# Tạo một bảng tra cứu ngược từ ID sang Tên cho ControlType để tiện sử dụng
+# Create a reverse lookup table from ID to Name for ControlType for convenience
 _CONTROL_TYPE_ID_TO_NAME = {v: k for k, v in uia_defines.IUIA().known_control_types.items()}
 
-# Cache cho thông tin tiến trình để tăng tốc độ
+# Cache for process information to improve performance
 PROC_INFO_CACHE = {}
 
 # ======================================================================
@@ -102,7 +103,7 @@ PROC_INFO_CACHE = {}
 
 def format_spec_to_string(spec_dict, spec_name="spec"):
     """
-    *** NEW: Public function to format a spec dictionary into a copyable string. ***
+    Public function to format a spec dictionary into a copyable string.
     """
     if not spec_dict:
         return f"{spec_name} = {{}}"
@@ -115,12 +116,38 @@ def format_spec_to_string(spec_dict, spec_name="spec"):
     content = "\n".join(items_str)
     return f"{spec_name} = {{\n{content}\n}}"
 
+def create_smart_quick_spec(info, spec_type='window'):
+    """Creates an intelligent, minimal, and reliable quick spec."""
+    spec = {}
+    if spec_type == 'window':
+        if info.get('pwa_title'): spec['pwa_title'] = info['pwa_title']
+        if info.get('proc_name'): spec['proc_name'] = info['proc_name']
+        if not spec and info.get('pwa_class_name'): spec['pwa_class_name'] = info['pwa_class_name']
+    elif spec_type == 'element':
+        if info.get('pwa_auto_id'): spec['pwa_auto_id'] = info['pwa_auto_id']
+        elif info.get('pwa_title'):
+            spec['pwa_title'] = info['pwa_title']
+            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
+        elif info.get('pwa_class_name'):
+            spec['pwa_class_name'] = info['pwa_class_name']
+            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
+    return format_spec_to_string(spec, f"{spec_type}_spec")
+
+def clean_element_spec(window_info, element_info):
+    """Removes duplicate properties from the element_spec."""
+    if not window_info or not element_info: return element_info
+    cleaned_spec = element_info.copy()
+    for key, value in list(element_info.items()):
+        if key in window_info and window_info[key] == value:
+            del cleaned_spec[key]
+    return cleaned_spec
+
 # ======================================================================
-#                      CÁC HÀM LẤY THÔNG TIN CƠ BẢN
+#                      CORE INFORMATION GETTERS
 # ======================================================================
 
 def get_process_info(pid):
-    """Lấy thông tin tiến trình và cache lại để tăng tốc độ."""
+    """Gets process information and caches it for performance."""
     if pid in PROC_INFO_CACHE:
         return PROC_INFO_CACHE[pid]
     if pid > 0:
@@ -141,7 +168,7 @@ def get_process_info(pid):
 
 def get_property_value(pwa_element, key, uia_instance=None, tree_walker=None):
     """
-    Hàm trung tâm để lấy giá trị của một thuộc tính từ một element của pywinauto.
+    Central function to get the value of a property from a pywinauto element.
     """
     prop = key.lower()
     
@@ -191,7 +218,7 @@ def get_property_value(pwa_element, key, uia_instance=None, tree_walker=None):
                     mid_point = rect.mid_point()
                     return (mid_point.x, mid_point.y)
             except Exception:
-                logger.debug(f"pwa_element.rectangle() thất bại. Thử truy cập COM trực tiếp.")
+                logger.debug(f"pwa_element.rectangle() failed. Trying direct COM access.")
                 if com_element:
                     try:
                         com_rect = com_element.CurrentBoundingRectangle
@@ -200,7 +227,7 @@ def get_property_value(pwa_element, key, uia_instance=None, tree_walker=None):
                         if prop == 'geo_center_point':
                             return ((com_rect.left + com_rect.right) // 2, (com_rect.top + com_rect.bottom) // 2)
                     except (comtypes.COMError, AttributeError):
-                        logger.debug(f"Truy cập COM trực tiếp cho BoundingRectangle cũng thất bại.")
+                        logger.debug(f"Direct COM access for BoundingRectangle also failed.")
                         return None
         
         # --- Process Properties ---
@@ -232,7 +259,7 @@ def get_property_value(pwa_element, key, uia_instance=None, tree_walker=None):
                         break
                     current = parent
                     if level > 50:
-                        logger.warning("Đã đạt đến độ sâu tối đa (50) khi tính rel_level.")
+                        logger.warning("Reached max depth (50) when calculating rel_level.")
                         break
                 return level
 
@@ -250,7 +277,7 @@ def get_property_value(pwa_element, key, uia_instance=None, tree_walker=None):
             
         return None
     except (comtypes.COMError, AttributeError, Exception) as e:
-        logger.debug(f"Lỗi khi lấy thuộc tính '{prop}': {type(e).__name__} - {e}")
+        logger.debug(f"Error getting property '{prop}': {type(e).__name__} - {e}")
         return None
 
 def get_all_properties(pwa_element, uia_instance=None, tree_walker=None):
@@ -274,7 +301,7 @@ def get_top_level_window(pwa_element):
         return None
 
 # ======================================================================
-#                      LỚP TÌM KIẾM ELEMENT TRUNG TÂM
+#                      CENTRAL ELEMENT FINDER CLASS
 # ======================================================================
 
 class ElementFinder:
@@ -285,27 +312,27 @@ class ElementFinder:
         self.tree_walker = tree_walker
 
     def find(self, search_pool, spec):
-        self.log('DEBUG', f"Bắt đầu tìm kiếm với spec: {spec}")
+        self.log('DEBUG', f"Starting search with spec: {spec}")
         try:
             candidates = search_pool()
         except Exception as e:
-            self.log('ERROR', f"Lỗi khi lấy danh sách ứng viên ban đầu: {e}")
+            self.log('ERROR', f"Error getting initial list of candidates: {e}")
             return []
-        self.log('DEBUG', f"Tìm thấy {len(candidates)} ứng viên ban đầu.")
+        self.log('DEBUG', f"Found {len(candidates)} initial candidates.")
         if not candidates: return []
         filter_spec, selector_spec = self._split_spec(spec)
         if filter_spec:
-            self.log('INFO', f"Áp dụng bộ lọc (filters) cho {len(candidates)} ứng viên...")
+            self.log('INFO', f"Applying filters to {len(candidates)} candidates...")
             candidates = self._apply_filters(candidates, filter_spec)
             if not candidates:
-                self.log('INFO', "Không còn ứng viên nào sau khi lọc.")
+                self.log('INFO', "No candidates left after filtering.")
                 return []
-            self.log('SUCCESS', f"Còn lại {len(candidates)} ứng viên sau khi lọc.")
+            self.log('SUCCESS', f"Remaining {len(candidates)} candidates after filtering.")
         if selector_spec:
-            self.log('INFO', f"Áp dụng bộ chọn (selectors) cho {len(candidates)} ứng viên...")
+            self.log('INFO', f"Applying selectors to {len(candidates)} candidates...")
             candidates = self._apply_selectors(candidates, selector_spec)
             if not candidates:
-                self.log('INFO', "Không còn ứng viên nào sau khi chọn.")
+                self.log('INFO', "No candidates left after selecting.")
                 return []
         return candidates
 
@@ -318,7 +345,7 @@ class ElementFinder:
         if not spec: return elements
         current_elements = list(elements)
         for key, criteria in spec.items():
-            self.log('FILTER', f"Lọc theo: {{'{key}': {repr(criteria)}}}")
+            self.log('FILTER', f"Filtering by: {{'{key}': {repr(criteria)}}}")
             initial_count = len(current_elements)
             kept_elements = []
             for elem in current_elements:
@@ -326,14 +353,14 @@ class ElementFinder:
                 matches = self._check_condition(actual_value, criteria)
                 log_msg_parts = []
                 if matches:
-                    log_msg_parts.append(("[GIỮ LẠI] ", 'KEEP'))
-                    log_msg_parts.append((f"'{elem.window_text()}' vì '{key}' có giá trị '{actual_value}' khớp.", 'DEBUG'))
+                    log_msg_parts.append(("[KEEP] ", 'KEEP'))
+                    log_msg_parts.append((f"'{elem.window_text()}' because '{key}' with value '{actual_value}' matches.", 'DEBUG'))
                 else:
-                    log_msg_parts.append(("[LOẠI BỎ] ", 'DISCARD'))
-                    log_msg_parts.append((f"'{elem.window_text()}' vì '{key}' có giá trị '{actual_value}' không khớp.", 'DEBUG'))
+                    log_msg_parts.append(("[DISCARD] ", 'DISCARD'))
+                    log_msg_parts.append((f"'{elem.window_text()}' because '{key}' with value '{actual_value}' does not match.", 'DEBUG'))
                 self.log('DEBUG', log_msg_parts)
                 if matches: kept_elements.append(elem)
-            self.log('INFO', f"  -> Kết quả: Giữ lại {len(kept_elements)}/{initial_count} ứng viên.")
+            self.log('INFO', f"  -> Result: Kept {len(kept_elements)}/{initial_count} candidates.")
             if not kept_elements: return []
             current_elements = kept_elements
         return current_elements
@@ -375,7 +402,7 @@ class ElementFinder:
         sorted_candidates = list(candidates)
         for key in [k for k in selectors if k != 'z_order_index']:
             index = selectors[key]
-            self.log('FILTER', f"Sắp xếp theo: '{key}' (Thứ tự: {'Giảm dần' if index < 0 else 'Tăng dần'})")
+            self.log('FILTER', f"Sorting by: '{key}' (Order: {'Descending' if index < 0 else 'Ascending'})")
             sort_key_func = self._get_sort_key_function(key)
             if sort_key_func:
                 sorted_candidates.sort(key=lambda e: (sort_key_func(e) is None, sort_key_func(e)), reverse=(index < 0))
@@ -386,13 +413,13 @@ class ElementFinder:
             last_selector_key = list(selectors.keys())[-1]
             final_index = selectors[last_selector_key]
             final_index = final_index - 1 if final_index > 0 else final_index
-        self.log('FILTER', f"Chọn phần tử tại index: {final_index}")
+        self.log('FILTER', f"Selecting item at index: {final_index}")
         try:
             selected = sorted_candidates[final_index]
-            self.log('SUCCESS', f"Đã chọn được ứng viên: '{selected.window_text()}'")
+            self.log('SUCCESS', f"Selected candidate: '{selected.window_text()}'")
             return [selected]
         except IndexError:
-            self.log('ERROR', f"Lựa chọn index={final_index} nằm ngoài phạm vi ({len(sorted_candidates)} ứng viên).")
+            self.log('ERROR', f"Index selection={final_index} is out of range for {len(sorted_candidates)} candidates.")
             return []
 
     def _get_sort_key_function(self, key):
