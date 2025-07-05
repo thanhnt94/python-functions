@@ -1,6 +1,6 @@
 # tool_scanner.py
 # A standalone tool for interactive UI element inspection using hotkeys.
-# Restored level-based highlight colors and geometry settings.
+# Renamed from ui_interactive_scan.py.
 
 import logging
 import re
@@ -28,7 +28,6 @@ except ImportError as e:
 
 # --- Shared Logic Import ---
 try:
-    # Standard import path
     import core_logic
 except ImportError:
     print("CRITICAL ERROR: 'core_logic.py' must be in the same directory.")
@@ -39,50 +38,9 @@ except ImportError:
 # ======================================================================
 
 HIGHLIGHT_DURATION_MS = 2500
-# *** RESTORED: Settings for window geometry ***
 DIALOG_WIDTH = 350 
 DIALOG_HEIGHT = 700
-# Default position on screen (e.g., "+10+10" for top-left, "-10+10" for top-right)
 DIALOG_DEFAULT_GEOMETRY = "-10-10" 
-
-# ======================================================================
-#                      SPEC FORMATTING UTILITY FUNCTIONS
-# ======================================================================
-
-def _format_dict_as_pep8_string(spec_dict):
-    """Formats a dictionary into a copyable string's content."""
-    if not spec_dict: return ""
-    dict_to_format = {k: v for k, v in spec_dict.items() if not k.startswith('sys_') and (v or v is False or v == 0)}
-    if not dict_to_format: return ""
-    items_str = [f"    '{k}': {repr(v)}," for k, v in sorted(dict_to_format.items())]
-    return "\n".join(items_str)
-
-def _create_smart_quick_spec(info, spec_type='window'):
-    """Creates an intelligent, minimal, and reliable quick spec."""
-    spec = {}
-    if spec_type == 'window':
-        if info.get('pwa_title'): spec['pwa_title'] = info['pwa_title']
-        if info.get('proc_name'): spec['proc_name'] = info['proc_name']
-        if not spec and info.get('pwa_class_name'): spec['pwa_class_name'] = info['pwa_class_name']
-    elif spec_type == 'element':
-        if info.get('pwa_auto_id'): spec['pwa_auto_id'] = info['pwa_auto_id']
-        elif info.get('pwa_title'):
-            spec['pwa_title'] = info['pwa_title']
-            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
-        elif info.get('pwa_class_name'):
-            spec['pwa_class_name'] = info['pwa_class_name']
-            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
-    content = _format_dict_as_pep8_string(spec)
-    return f"{core_logic.format_spec_to_string(spec, f'{spec_type}_spec')}"
-
-def _clean_element_spec(window_info, element_info):
-    """Removes duplicate properties from the element_spec."""
-    if not window_info or not element_info: return element_info
-    cleaned_spec = element_info.copy()
-    for key, value in list(element_info.items()):
-        if key in window_info and window_info[key] == value:
-            del cleaned_spec[key]
-    return cleaned_spec
 
 # ======================================================================
 #                      SCANNER LOGIC CLASS
@@ -182,13 +140,12 @@ class InteractiveScannerLogic:
 
         coords = element_details.get('geo_bounding_rect_tuple')
         if coords:
-            # *** RESTORED: Pass the level to the highlight function ***
             level = element_details.get('rel_level', 0)
             self.root_gui.draw_highlight(element_pwa.rectangle(), level)
         else:
             self.logger.warning("Could not get element coordinates to draw highlight.")
 
-        cleaned_element_details = _clean_element_spec(window_details, element_details)
+        cleaned_element_details = core_logic.clean_element_spec(window_details, element_details)
         self.root_gui.update_spec_dialog(window_details, cleaned_element_details)
 
 # ======================================================================
@@ -200,7 +157,6 @@ class ScannerApp(tk.Tk):
         super().__init__()
         
         self.title("Interactive Scan Results")
-        # *** RESTORED: Use constants for geometry ***
         self.geometry(f"{DIALOG_WIDTH}x{DIALOG_HEIGHT}{DIALOG_DEFAULT_GEOMETRY}")
         self.wm_attributes("-topmost", 1)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -299,13 +255,13 @@ class ScannerApp(tk.Tk):
         proc_name = window_info.get('proc_name', 'Unknown')
         self.status_label.config(text=f"Level: {level} | Process: {proc_name}")
 
-        self.quick_win_spec_str = _create_smart_quick_spec(window_info, 'window')
-        self.quick_elem_spec_str = _create_smart_quick_spec(element_info, 'element')
+        self.quick_win_spec_str = core_logic.create_smart_quick_spec(window_info, 'window')
+        self.quick_elem_spec_str = core_logic.create_smart_quick_spec(element_info, 'element')
 
         win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
         self.win_text.config(state="normal"); self.win_text.delete("1.0", "end"); self.win_text.insert("1.0", win_spec_str); self.win_text.config(state="disabled")
         
-        elem_spec_str = core_logic.format_spec_to_string(_clean_element_spec(window_info, element_info), "element_spec")
+        elem_spec_str = core_logic.format_spec_to_string(core_logic.clean_element_spec(window_info, element_info), "element_spec")
         self.elem_text.config(state="normal"); self.elem_text.delete("1.0", "end"); self.elem_text.insert("1.0", elem_spec_str); self.elem_text.config(state="disabled")
         
         combined_quick_spec_str = f"{self.quick_win_spec_str}\n\n{self.quick_elem_spec_str}"
@@ -321,7 +277,6 @@ class ScannerApp(tk.Tk):
         """Draws a highlight rectangle on the screen."""
         self.destroy_highlight()
         try:
-            # *** RESTORED: List of colors for level-based highlighting ***
             colors = ['#FF0000', '#FF7F00', '#FFFF00', '#00FF00', '#0000FF', '#4B0082', '#9400D3']
             color = colors[level % len(colors)]
 

@@ -1,6 +1,6 @@
 # tool_explorer.py
 # A standalone and embeddable tool for full window element scanning.
-# Refactored to be a modular component that can be imported.
+# Final version with synchronized detail window layout.
 
 import logging
 import re
@@ -102,6 +102,14 @@ class ExplorerTab(ttk.Frame):
     def __init__(self, parent, status_label_widget):
         super().__init__(parent)
         self.pack(fill="both", expand=True) 
+        
+        style = ttk.Style(self)
+        style.theme_use('clam')
+        style.configure("TLabel", font=('Segoe UI', 10))
+        style.configure("TButton", font=('Segoe UI', 10, 'bold'), padding=5)
+        style.configure("TLabelframe.Label", font=('Segoe UI', 11, 'bold'))
+        style.configure("Treeview.Heading", font=('Segoe UI', 10, 'bold'))
+        style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
         
         self.status_label = status_label_widget
         self.scanner = FullScanner()
@@ -273,47 +281,67 @@ class ExplorerTab(ttk.Frame):
         detail_win.grab_set()
         window_info = core_logic.get_all_properties(self.selected_window_object, self.scanner.uia, self.scanner.tree_walker)
         element_info = self.selected_element_data
-        cleaned_element_info = core_logic._clean_element_spec(window_info, element_info)
+        cleaned_element_info = core_logic.clean_element_spec(window_info, element_info)
+        
         def copy_to_clipboard(content, button):
             detail_win.clipboard_clear(); detail_win.clipboard_append(content); detail_win.update()
             original_text = button.cget("text"); button.config(text="✅")
             detail_win.after(1500, lambda: button.config(text=original_text))
+
         main_frame = ttk.Frame(detail_win, padding=10)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1); main_frame.rowconfigure(2, weight=1)
+        
+        # --- Window Spec Frame ---
         win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
-        quick_win_spec_str = core_logic._create_smart_quick_spec(window_info, 'window')
+        quick_win_spec_str = core_logic.create_smart_quick_spec(window_info, 'window')
         win_frame = ttk.LabelFrame(main_frame, text="Window Specification", padding=(10, 5))
         win_frame.grid(row=0, column=0, sticky="nsew", pady=5)
         win_frame.columnconfigure(0, weight=1); win_frame.rowconfigure(0, weight=1)
-        win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10)); win_text.grid(sticky="nsew")
+        
+        win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10))
+        win_text.grid(row=0, column=0, sticky="nsew")
         win_text.insert("1.0", win_spec_str); win_text.config(state="disabled")
-        win_btn_frame = ttk.Frame(win_frame); win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        
+        win_btn_frame = ttk.Frame(win_frame)
+        win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
         copy_full_win_btn = ttk.Button(win_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(win_spec_str, copy_full_win_btn))
         copy_full_win_btn.pack(side='left', padx=2)
         copy_quick_win_btn = ttk.Button(win_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_win_spec_str, copy_quick_win_btn))
         copy_quick_win_btn.pack(side='left', padx=2)
+
+        # --- Element Spec Frame ---
         elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
-        quick_elem_spec_str = core_logic._create_smart_quick_spec(cleaned_element_info, 'element')
+        quick_elem_spec_str = core_logic.create_smart_quick_spec(cleaned_element_info, 'element')
         elem_frame = ttk.LabelFrame(main_frame, text="Element Specification (duplicates removed)", padding=(10, 5))
         elem_frame.grid(row=1, column=0, sticky="nsew", pady=5)
         elem_frame.columnconfigure(0, weight=1); elem_frame.rowconfigure(0, weight=1)
-        elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10)); elem_text.grid(sticky="nsew")
+        
+        elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10))
+        elem_text.grid(row=0, column=0, sticky="nsew")
         elem_text.insert("1.0", elem_spec_str); elem_text.config(state="disabled")
-        elem_btn_frame = ttk.Frame(elem_frame); elem_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        
+        elem_btn_frame = ttk.Frame(elem_frame)
+        elem_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
         copy_full_elem_btn = ttk.Button(elem_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(elem_spec_str, copy_full_elem_btn))
         copy_full_elem_btn.pack(side='left', padx=2)
         copy_quick_elem_btn = ttk.Button(elem_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_elem_spec_str, copy_quick_elem_btn))
         copy_quick_elem_btn.pack(side='left', padx=2)
+
+        # --- Combined Spec Frame ---
         combined_quick_spec_str = f"{quick_win_spec_str}\n\n{quick_elem_spec_str}"
         quick_frame = ttk.LabelFrame(main_frame, text="Combined Quick Spec", padding=(10, 5))
         quick_frame.grid(row=2, column=0, sticky="nsew", pady=5)
         quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
-        quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10)); quick_text.grid(sticky="nsew")
+        
+        quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
+        quick_text.grid(row=0, column=0, sticky="nsew")
         quick_text.insert("1.0", combined_quick_spec_str); quick_text.config(state="disabled")
-        quick_btn_frame = ttk.Frame(quick_frame); quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_combined_quick_btn = ttk.Button(quick_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(combined_quick_spec_str, copy_combined_quick_btn))
+        
+        quick_btn_frame = ttk.Frame(quick_frame)
+        quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        copy_combined_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(combined_quick_spec_str, copy_combined_quick_btn))
         copy_combined_quick_btn.pack(side='left', padx=2)
 
     def export_to_excel(self):
