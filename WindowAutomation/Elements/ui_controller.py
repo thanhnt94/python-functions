@@ -1,5 +1,6 @@
 # Elements/ui_controller.py
-# Phiên bản 19.0: Logging siêu chi tiết, in ra tất cả các ứng viên và các thuộc tính được lọc.
+# Phiên bản 20.1: Sửa lỗi import để có thể chạy trực tiếp.
+# Hỗ trợ đầy đủ các thuộc tính từ ui_inspector, bao gồm cả UIA patterns.
 
 import logging
 import re
@@ -19,6 +20,8 @@ try:
     from pynput import mouse, keyboard
     from pywinauto.findwindows import ElementNotFoundError
     from pywinauto import Desktop
+    import comtypes
+    from comtypes.gen import UIAutomationClient as UIA
 except ImportError as e:
     print(f"Lỗi import thư viện, vui lòng cài đặt: {e}")
     exit()
@@ -35,27 +38,30 @@ class UIActionError(Exception): pass
 class WindowNotFoundError(UIActionError): pass
 class AmbiguousElementError(UIActionError): pass
 
-# --- Import an toàn và Hàm trợ giúp ---
+# --- Import các thành phần dùng chung (Đã sửa lỗi) ---
 try:
+    # Cách import này dùng khi chạy file như một phần của package lớn hơn
+    from . import ui_shared_logic
     from .ui_notify import StatusNotifier
-
-    def create_notifier_callback(notifier_instance):
-        if not isinstance(notifier_instance, StatusNotifier):
-            return None
-        
-        def event_handler(event_type, message, **kwargs):
-            notifier_instance.update_status(
-                text=message,
-                style=event_type,
-                duration=kwargs.get('duration')
-            )
-        return event_handler
-
 except ImportError:
-    logging.warning("Module 'ui_notify' không được tìm thấy. Các tính năng thông báo sẽ bị vô hiệu hóa.")
-    StatusNotifier = None
-    def create_notifier_callback(notifier_instance):
+    # Cách import này dùng khi chạy file ui_controller.py trực tiếp
+    import ui_shared_logic
+    try:
+        from ui_notify import StatusNotifier
+    except ImportError:
+        StatusNotifier = None # Cho phép chạy mà không cần ui_notify
+
+def create_notifier_callback(notifier_instance):
+    if not isinstance(notifier_instance, StatusNotifier):
         return None
+    
+    def event_handler(event_type, message, **kwargs):
+        notifier_instance.update_status(
+            text=message,
+            style=event_type,
+            duration=kwargs.get('duration')
+        )
+    return event_handler
 
 # ======================================================================
 #                      CẤU HÌNH MẶC ĐỊNH
@@ -73,15 +79,8 @@ class UIController:
     # ======================================================================
     #                      BỘ TỪ KHÓA VÀ THAM SỐ HỢP LỆ
     # ======================================================================
-    PWA_PROPS = {"pwa_title", "pwa_auto_id", "pwa_control_type", "pwa_class_name", "pwa_framework_id"}
-    WIN32_PROPS = {"win32_handle", "win32_styles", "win32_extended_styles"}
-    STATE_PROPS = {"state_is_visible", "state_is_enabled", "state_is_active", "state_is_minimized", "state_is_maximized",
-                   "state_is_focusable", "state_is_password", "state_is_offscreen", "state_is_content_element", "state_is_control_element"}
-    GEO_PROPS = {"geo_rectangle_tuple", "geo_bounding_rect_tuple", "geo_center_point"}
-    PROC_PROPS = {"proc_pid", "proc_thread_id", "proc_name", "proc_path", "proc_cmdline", "proc_create_time", "proc_username"}
-    REL_PROPS = {"rel_level", "rel_parent_handle", "rel_parent_title", "rel_labeled_by", "rel_child_count"}
-    SUPPORTED_KEYS = PWA_PROPS | WIN32_PROPS | STATE_PROPS | GEO_PROPS | PROC_PROPS | REL_PROPS
-    
+    SUPPORTED_KEYS = ui_shared_logic.SUPPORTED_FILTER_KEYS
+
     GETTABLE_PROPERTIES = {'text', 'texts', 'value', 'is_toggled'}.union(SUPPORTED_KEYS)
     BACKGROUND_SAFE_ACTIONS = {'set_text', 'send_message_text'}
     SENSITIVE_ACTIONS = {'paste_text', 'type_keys', 'set_text'}
@@ -104,7 +103,7 @@ class UIController:
         
         if event_callback:
             self.event_callback = event_callback
-        elif notifier:
+        elif notifier and StatusNotifier:
             self.event_callback = create_notifier_callback(notifier)
         else:
             self.event_callback = None
@@ -118,7 +117,13 @@ class UIController:
         self._last_human_activity_time = time.time() - self.human_cooldown_period
         self._is_bot_acting = False
         self._bot_acting_lock = threading.Lock()
-        self._proc_info_cache = {}
+        
+        try:
+            self.uia = comtypes.client.CreateObject(UIA.CUIAutomation)
+            self.tree_walker = self.uia.ControlViewWalker
+        except (OSError, comtypes.COMError) as e:
+            self.logger.critical(f"Lỗi nghiêm trọng khi khởi tạo COM: {e}", exc_info=True)
+            raise
         
         if self.human_interruption_detection:
             self._start_input_listener()
@@ -160,22 +165,6 @@ class UIController:
         
         self._emit_event('warning', f"Hết thời gian chờ: '{display_message}'")
         return None
-
-    def select_element(self, window_spec, element_spec=None, timeout=None, retry_interval=None, description=None, notify_style='info'):
-        timeout = timeout if timeout is not None else DEFAULT_CONTROLLER_CONFIG['default_timeout']
-        retry_interval = retry_interval if retry_interval is not None else DEFAULT_CONTROLLER_CONFIG['default_retry_interval']
-        
-        display_message = description or "Tìm kiếm element"
-        self._emit_event(notify_style if description else 'info', display_message)
-        
-        try:
-            self._wait_for_user_idle()
-            target_element = self._find_target(window_spec, element_spec, timeout, retry_interval)
-            return target_element
-        except Exception as e:
-            self._emit_event('error', f"Thất bại: {display_message}")
-            self.logger.error(f"Lỗi khi thực hiện '{display_message}': {e}", exc_info=True)
-            return None
 
     def run_action(self, window_spec, element_spec=None, action=None, timeout=None, auto_activate=False, retry_interval=None, description=None, notify_style='info'):
         timeout = timeout if timeout is not None else DEFAULT_CONTROLLER_CONFIG['default_timeout']
@@ -233,11 +222,10 @@ class UIController:
             return None
 
     # ======================================================================
-    #                           CÁC HÀM NỘI BỘ
+    #                           CÁC HÀM NỘI BỘ (Đã tái cấu trúc)
     # ======================================================================
     
     def _find_unique_element(self, spec, find_func, search_type):
-        """Hàm tìm kiếm cốt lõi với logging siêu chi tiết."""
         filter_spec, selector_spec = self._split_spec(spec)
         native_spec, custom_filters = self._split_pwa_native_spec(filter_spec)
         
@@ -246,22 +234,7 @@ class UIController:
         if not candidates:
             raise ElementNotFoundError(f"[{search_type}] Lọc thô thất bại, không tìm thấy ứng viên nào với: {native_spec}")
         
-        # Cải tiến: Ghi log chi tiết các ứng viên tìm thấy
         self.logger.debug(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên sau lọc thô.")
-        if len(candidates) > 1 and self.logger.getEffectiveLevel() <= logging.DEBUG:
-            # Lấy danh sách các key đã được dùng để lọc
-            spec_keys = list(custom_filters.keys())
-            
-            candidate_details = []
-            for i, cand in enumerate(candidates):
-                details = [f"Title='{cand.window_text()}'", f"Class='{cand.class_name()}'"]
-                for key in spec_keys:
-                    value = self._get_actual_value(cand, key)
-                    details.append(f"{key}='{value}'")
-                candidate_details.append(f"    #{i}: " + ", ".join(details))
-
-            log_message = "  --- Danh sách ứng viên ---\n" + "\n".join(candidate_details)
-            self.logger.debug(log_message)
 
         self.logger.debug(f"[{search_type}] Bắt đầu lọc tinh với spec: {custom_filters}")
         candidates = self._apply_filters(candidates, custom_filters)
@@ -269,17 +242,6 @@ class UIController:
             raise ElementNotFoundError(f"[{search_type}] Lọc tinh thất bại, không còn ứng viên nào sau khi áp dụng: {custom_filters}")
         
         self.logger.debug(f"[{search_type}] Còn lại {len(candidates)} ứng viên sau lọc tinh.")
-        if len(candidates) > 1 and self.logger.getEffectiveLevel() <= logging.DEBUG:
-            spec_keys = list(custom_filters.keys())
-            candidate_details = []
-            for i, cand in enumerate(candidates):
-                details = [f"Title='{cand.window_text()}'", f"Class='{cand.class_name()}'"]
-                for key in spec_keys:
-                    value = self._get_actual_value(cand, key)
-                    details.append(f"{key}='{value}'")
-                candidate_details.append(f"    #{i}: " + ", ".join(details))
-            log_message = "  --- Danh sách ứng viên còn lại ---\n" + "\n".join(candidate_details)
-            self.logger.debug(log_message)
 
         if selector_spec:
             self.logger.debug(f"[{search_type}] Bắt đầu lựa chọn với spec: {selector_spec}")
@@ -287,71 +249,12 @@ class UIController:
         
         if len(candidates) > 1:
             details = [f"'{c.window_text()}' (pid: {c.process_id()})" for c in candidates[:5]]
-            raise AmbiguousElementError(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên không rõ ràng. Vui lòng cung cấp thêm bộ chọn (ví dụ: sort_by_...). Chi tiết: {details}")
+            raise AmbiguousElementError(f"[{search_type}] Tìm thấy {len(candidates)} ứng viên không rõ ràng. Vui lòng cung cấp thêm bộ chọn. Chi tiết: {details}")
         if not candidates:
             raise ElementNotFoundError(f"[{search_type}] Không còn ứng viên nào sau khi lựa chọn.")
         
         self.logger.debug(f"[{search_type}] Đã chọn được ứng viên duy nhất.")
         return candidates[0]
-
-    def _wait_for_user_idle(self):
-        if not self.human_interruption_detection:
-            return
-        
-        is_paused = False
-        while time.time() - self._last_human_activity_time < self.human_cooldown_period:
-            if not is_paused:
-                self.logger.info("Phát hiện người dùng đang hoạt động. Chương trình sẽ tạm dừng...")
-                self._emit_event('warning', "Phát hiện người dùng! Tạm dừng...")
-                is_paused = True
-
-            remaining = self.human_cooldown_period - (time.time() - self._last_human_activity_time)
-            countdown_message = f"Tiếp tục sau {math.ceil(remaining)} giây."
-            
-            self._emit_event('process', countdown_message, duration=1.5)
-            print(f"\r{countdown_message} ", end="", flush=True)
-            time.sleep(1)
-
-        if is_paused:
-            print() 
-            self.logger.info("Người dùng đã ngừng hoạt động. Tiếp tục thực thi...")
-            self._emit_event('success', "Người dùng đã ngừng. Tiếp tục thực thi...", duration=3)
-
-    def _handle_activation(self, target_element, command, timeout, auto_activate, verbose=True):
-        top_window = target_element.top_level_parent()
-        if not top_window.is_active():
-            if auto_activate:
-                if verbose: self._emit_event('info', f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
-                if top_window.is_minimized(): top_window.restore()
-                top_window.set_focus()
-                time.sleep(0.5)
-                if not top_window.is_active():
-                    self.logger.info("set_focus() không đủ, thử phương pháp minimize/restore...")
-                    try:
-                        top_window.minimize()
-                        time.sleep(0.5)
-                        top_window.restore()
-                        time.sleep(0.5)
-                        top_window.set_focus()
-                    except Exception as e:
-                        self.logger.warning(f"Lỗi khi thử minimize/restore: {e}")
-                        top_window.set_focus()
-                wait_start = time.time()
-                while time.time() - wait_start < 5:
-                    if top_window.is_active():
-                        self.logger.info("-> Kích hoạt thành công.")
-                        return
-                    time.sleep(0.2)
-                raise UIActionError("Nỗ lực tự động kích hoạt cửa sổ thất bại.")
-            else:
-                if verbose: self._emit_event('warning', f"Cửa sổ '{top_window.window_text()}' không active. Vui lòng click vào.")
-                wait_start_time = time.time()
-                while time.time() - wait_start_time < timeout:
-                    if top_window.is_active():
-                        self.logger.info("Cửa sổ đã được kích hoạt.")
-                        return
-                    time.sleep(0.5)
-                raise UIActionError(f"Hết thời gian chờ. Cửa sổ không được kích hoạt.")
 
     def _find_target(self, window_spec, element_spec=None, timeout=10, retry_interval=0.5, verbose=True):
         start_time = time.time()
@@ -384,68 +287,20 @@ class UIController:
         
         raise WindowNotFoundError(f"Không thể tìm thấy mục tiêu sau {timeout} giây. Lỗi cuối cùng: {last_error}")
 
-    def _get_process_info(self, pid):
-        if pid in self._proc_info_cache: return self._proc_info_cache[pid]
-        if pid > 0:
-            try:
-                p = psutil.Process(pid)
-                info = {'proc_name': p.name(), 'proc_path': p.exe(), 'proc_cmdline': ' '.join(p.cmdline()),
-                        'proc_create_time': datetime.fromtimestamp(p.create_time()).strftime('%Y-%m-%d %H:%M:%S'), 'proc_username': p.username()}
-                self._proc_info_cache[pid] = info
-                return info
-            except (psutil.NoSuchProcess, psutil.AccessDenied): pass
-        return {}
-
-    def _start_input_listener(self):
-        listener_thread = threading.Thread(target=self._run_listeners, daemon=True)
-        listener_thread.start()
-
-    def _update_last_activity(self, *args):
-        with self._bot_acting_lock:
-            if not self._is_bot_acting: self._last_human_activity_time = time.time()
-
-    def _run_listeners(self):
-        with mouse.Listener(on_move=self._update_last_activity, on_click=self._update_last_activity, on_scroll=self._update_last_activity) as m_listener:
-            with keyboard.Listener(on_press=self._update_last_activity) as k_listener:
-                m_listener.join()
-                k_listener.join()
-
-    def _execute_action_safely(self, element, action_str):
-        with self._bot_acting_lock: self._is_bot_acting = True
-        try: self._execute_action(element, action_str)
-        finally:
-            with self._bot_acting_lock: self._is_bot_acting = False
-
-    def _split_spec(self, spec):
-        filter_spec = {k: v for k, v in spec.items() if k not in self.SORTING_KEYS}
-        selector_spec = {k: v for k, v in spec.items() if k in self.SORTING_KEYS}
-        return filter_spec, selector_spec
-
-    def _split_pwa_native_spec(self, spec):
-        native_spec, custom_filters = {}, {}
-        native_keys = { 'pwa_title': 'title', 'pwa_class_name': 'class_name', 'win32_handle': 'handle', 'proc_pid': 'process' }
-        for key, value in spec.items():
-            if key in native_keys and not isinstance(value, tuple):
-                native_spec[native_keys[key]] = value
-            else:
-                custom_filters[key] = value
-        return native_spec, custom_filters
-
     def _apply_filters(self, elements, spec):
         if not spec: return elements
         return [elem for elem in elements if self._element_matches_spec(elem, spec)]
 
     def _element_matches_spec(self, elem, spec):
         for key, criteria in spec.items():
-            if key == 'pwa_control_type' and isinstance(criteria, int):
-                if elem.element_info.control_id != criteria: return False
-                continue
             actual_value = self._get_actual_value(elem, key)
-            if not self._check_condition(actual_value, criteria): return False
+            if not self._check_condition(actual_value, criteria):
+                return False
         return True
 
     def _check_condition(self, actual_value, criteria):
-        if not isinstance(criteria, tuple): return actual_value == criteria
+        if not isinstance(criteria, tuple):
+            return actual_value == criteria
         if len(criteria) != 2:
             self.logger.warning(f"Cú pháp bộ lọc không hợp lệ: {criteria}. Bỏ qua.")
             return False
@@ -492,7 +347,8 @@ class UIController:
                 reverse_order = (index < 0)
                 sorted_candidates.sort(key=sort_key_func, reverse=reverse_order)
         final_index = 0
-        if 'z_order_index' in selectors: final_index = selectors['z_order_index']
+        if 'z_order_index' in selectors:
+            final_index = selectors['z_order_index']
         elif selectors:
             last_selector_key = list(selectors.keys())[-1]
             final_index = selectors[last_selector_key]
@@ -503,9 +359,12 @@ class UIController:
             raise ElementNotFoundError(f"Lựa chọn index={final_index} nằm ngoài phạm vi.")
         
     def _get_sort_key_function(self, key):
-        if key == 'sort_by_creation_time': return lambda e: self._get_actual_value(e, 'proc_create_time') or 0
-        if key == 'sort_by_title_length': return lambda e: len(self._get_actual_value(e, 'pwa_title') or '')
-        if key == 'sort_by_child_count': return lambda e: self._get_actual_value(e, 'rel_child_count') or 0
+        if key == 'sort_by_creation_time':
+            return lambda e: self._get_actual_value(e, 'proc_create_time') or datetime.min
+        if key == 'sort_by_title_length':
+            return lambda e: len(self._get_actual_value(e, 'pwa_title') or '')
+        if key == 'sort_by_child_count':
+            return lambda e: self._get_actual_value(e, 'rel_child_count') or 0
         if key in ['sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height']:
             def get_rect_prop(elem, prop_key):
                 rect = self._get_actual_value(elem, 'geo_bounding_rect_tuple')
@@ -518,43 +377,20 @@ class UIController:
         return None
 
     def _get_actual_value(self, element, key):
-        prop = key.lower()
-        try:
-            if prop in {'text', 'texts', 'value', 'is_toggled'}:
-                if prop == 'text': return element.window_text()
-                if prop == 'texts': return element.texts()
-                if prop == 'value': return element.get_value() if hasattr(element, 'get_value') else None
-                if prop == 'is_toggled': return element.get_toggle_state() == 1 if hasattr(element, 'get_toggle_state') else None
-            if prop in self.PWA_PROPS:
-                prop_map = {'pwa_title': 'name', 'pwa_auto_id': 'automation_id', 'pwa_class_name': 'class_name', 'pwa_control_type': 'control_type', 'pwa_framework_id': 'framework_id'}
-                pwa_prop = prop_map.get(prop)
-                return getattr(element.element_info, pwa_prop, None) if pwa_prop else None
-            if prop in self.STATE_PROPS:
-                if prop == 'state_is_visible': return element.is_visible()
-                # ...
-            handle = element.handle
-            if handle:
-                if prop in self.WIN32_PROPS:
-                    if prop == 'win32_handle': return handle
-                    # ...
-                if prop == 'rel_parent_handle': return win32gui.GetParent(handle)
-                if prop == 'proc_thread_id': return win32process.GetWindowThreadProcessId(handle)[0]
-            if prop in self.GEO_PROPS:
-                rect = element.rectangle()
-                if prop in ['geo_rectangle_tuple', 'geo_bounding_rect_tuple']: return rect.left, rect.top, rect.right, rect.bottom
-                # ...
-            if prop in self.PROC_PROPS:
-                pid = element.process_id()
-                if prop == 'proc_pid': return pid
-                proc_info = self._get_process_info(pid)
-                # ...
-            if prop in self.REL_PROPS:
-                if prop == 'rel_child_count': return len(element.children())
-                # ...
-            return None
-        except Exception as e:
-            self.logger.debug(f"Lỗi nhỏ khi lấy thuộc tính '{prop}': {e}")
-            return None
+        if key.lower() in {'text', 'texts'}:
+            try:
+                if key.lower() == 'text': return element.window_text()
+                if key.lower() == 'texts': return element.texts()
+            except Exception as e:
+                self.logger.debug(f"Lỗi khi lấy thuộc tính pywinauto '{key}': {e}")
+                return None
+
+        return ui_shared_logic.get_property_value(
+            pwa_element=element,
+            key=key,
+            uia_instance=self.uia,
+            tree_walker=self.tree_walker
+        )
 
     def _execute_action(self, element, action_str):
         self.logger.debug(f"Thực thi hành động '{action_str}' trên element '{element.window_text()}'")
@@ -564,8 +400,13 @@ class UIController:
         try:
             if command not in self.VALID_ACTIONS:
                 raise ValueError(f"Hành động '{command}' không được hỗ trợ.")
+            
             if command == 'click': element.click_input()
-            # ...
+            elif command == 'double_click': element.double_click_input()
+            elif command == 'right_click': element.right_click_input()
+            elif command == 'focus': element.set_focus()
+            elif command == 'invoke': element.invoke()
+            elif command == 'toggle': element.toggle()
             elif command in ('select', 'set_text', 'paste_text', 'type_keys', 'send_message_text'):
                 if value is None: raise ValueError(f"Hành động '{command}' cần có giá trị.")
                 if command == 'select': element.select(value)
@@ -580,3 +421,60 @@ class UIController:
                     win32api.SendMessage(element.handle, win32con.WM_SETTEXT, 0, value)
         except Exception as e:
             raise UIActionError(f"Thực thi hành động '{action_str}' thất bại. Lỗi gốc: {type(e).__name__} - {e}") from e
+
+    def _split_spec(self, spec):
+        filter_spec = {k: v for k, v in spec.items() if k not in self.SORTING_KEYS}
+        selector_spec = {k: v for k, v in spec.items() if k in self.SORTING_KEYS}
+        return filter_spec, selector_spec
+
+    def _split_pwa_native_spec(self, spec):
+        native_spec, custom_filters = {}, {}
+        native_keys = { 'pwa_title': 'title', 'pwa_class_name': 'class_name', 'win32_handle': 'handle', 'proc_pid': 'process' }
+        for key, value in spec.items():
+            if key in native_keys and not isinstance(value, tuple):
+                native_spec[native_keys[key]] = value
+            else:
+                custom_filters[key] = value
+        return native_spec, custom_filters
+        
+    def _wait_for_user_idle(self):
+        if not self.human_interruption_detection: return
+        is_paused = False
+        while time.time() - self._last_human_activity_time < self.human_cooldown_period:
+            if not is_paused:
+                self._emit_event('warning', "Phát hiện người dùng! Tạm dừng...")
+                is_paused = True
+            time.sleep(1)
+        if is_paused:
+            self._emit_event('success', "Người dùng đã ngừng. Tiếp tục thực thi...", duration=3)
+
+    def _handle_activation(self, target_element, command, timeout, auto_activate, verbose=True):
+        top_window = target_element.top_level_parent()
+        if not top_window.is_active():
+            if auto_activate:
+                if verbose: self._emit_event('info', f"Tự động kích hoạt cửa sổ '{top_window.window_text()}'...")
+                if top_window.is_minimized(): top_window.restore()
+                top_window.set_focus()
+                time.sleep(0.5)
+            else:
+                raise UIActionError(f"Cửa sổ '{top_window.window_text()}' không active. Hành động '{command}' yêu cầu kích hoạt.")
+
+    def _execute_action_safely(self, element, action_str):
+        with self._bot_acting_lock: self._is_bot_acting = True
+        try: self._execute_action(element, action_str)
+        finally:
+            with self._bot_acting_lock: self._is_bot_acting = False
+
+    def _start_input_listener(self):
+        listener_thread = threading.Thread(target=self._run_listeners, daemon=True)
+        listener_thread.start()
+
+    def _update_last_activity(self, *args):
+        with self._bot_acting_lock:
+            if not self._is_bot_acting: self._last_human_activity_time = time.time()
+
+    def _run_listeners(self):
+        with mouse.Listener(on_move=self._update_last_activity, on_click=self._update_last_activity, on_scroll=self._update_last_activity) as m_listener:
+            with keyboard.Listener(on_press=self._update_last_activity) as k_listener:
+                m_listener.join()
+                k_listener.join()
