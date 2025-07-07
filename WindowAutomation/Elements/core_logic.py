@@ -1,6 +1,7 @@
 # core_logic.py
 # Contains the core, shared logic and ALL definitions for the suite.
-# This is the single source of truth for parameters, operators, and actions.
+# --- VERSION 7.0: Added 'sort_by_scan_order' as the primary, most stable sorting key.
+# The ElementFinder is now optimized to handle this key efficiently.
 
 import logging
 import re
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 #                      CENTRAL DEFINITIONS
 # ======================================================================
 
-# --- Property Definitions ---
+# --- Property Definitions (Parameters for filtering) ---
 PARAMETER_DEFINITIONS = {
     "pwa_title": "The visible text/name of the element (most important).",
     "pwa_auto_id": "Automation ID, a unique identifier for the element within the application.",
@@ -105,6 +106,20 @@ ACTION_DEFINITIONS = [
     {'category': 'State', 'name': 'select', 'example': "action='select:Item Name'", 'desc': "Selects an item in a list box, combo box, or tab control by its name."},
 ]
 
+# --- Selector Definitions (for sorting and picking) ---
+# Reordered to place the recommended key at the top.
+SELECTOR_DEFINITIONS = [
+    {'name': 'sort_by_scan_order', 'example': "'sort_by_scan_order': 2", 'desc': "RECOMMENDED. Selects the Nth element found during the scan. Most stable and predictable."},
+    {'name': 'sort_by_y_pos', 'example': "'sort_by_y_pos': 1", 'desc': "Sorts elements by their Y coordinate (top to bottom). Use 1 for the topmost element."},
+    {'name': 'sort_by_x_pos', 'example': "'sort_by_x_pos': -1", 'desc': "Sorts elements by their X coordinate (left to right). Use -1 for the rightmost element."},
+    {'name': 'sort_by_creation_time', 'example': "'sort_by_creation_time': -1", 'desc': "Sorts windows by their creation time. Use -1 for newest, 1 for oldest."},
+    {'name': 'sort_by_height', 'example': "'sort_by_height': -1", 'desc': "Sorts elements by their height. Use -1 for the tallest element."},
+    {'name': 'sort_by_width', 'example': "'sort_by_width': -1", 'desc': "Sorts elements by their width. Use -1 for the widest element."},
+    {'name': 'sort_by_title_length', 'example': "'sort_by_title_length': 1", 'desc': "Sorts elements by the length of their title text. Use 1 for the shortest title."},
+    {'name': 'sort_by_child_count', 'example': "'sort_by_child_count': -1", 'desc': "Sorts elements by the number of direct children they have. Use -1 for the one with the most children."},
+    {'name': 'z_order_index', 'example': "'z_order_index': 1", 'desc': "Selects an element based on its Z-order (drawing order). Rarely needed."},
+]
+
 # --- Property Sets ---
 PWA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('pwa_')}
 WIN32_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('win32_')}
@@ -115,17 +130,10 @@ REL_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('rel_')}
 UIA_PROPS = {k for k in PARAMETER_DEFINITIONS if k.startswith('uia_')}
 
 # --- Selectors and Operators ---
-SORTING_KEYS = {'sort_by_creation_time', 'sort_by_title_length', 'sort_by_child_count',
-                'sort_by_y_pos', 'sort_by_x_pos', 'sort_by_width', 'sort_by_height', 'z_order_index'}
+SORTING_KEYS = {item['name'] for item in SELECTOR_DEFINITIONS}
 VALID_OPERATORS = STRING_OPERATORS.union(NUMERIC_OPERATORS)
-
-# Set of all supported filter keys
 SUPPORTED_FILTER_KEYS = PWA_PROPS | WIN32_PROPS | STATE_PROPS | GEO_PROPS | PROC_PROPS | REL_PROPS | UIA_PROPS
-
-# Create a reverse lookup table from ID to Name for ControlType for convenience
 _CONTROL_TYPE_ID_TO_NAME = {v: k for k, v in uia_defines.IUIA().known_control_types.items()}
-
-# Cache for process information to improve performance
 PROC_INFO_CACHE = {}
 
 # ======================================================================
@@ -146,26 +154,6 @@ def format_spec_to_string(spec_dict, spec_name="spec"):
     items_str = [f"    '{k}': {repr(v)}," for k, v in sorted(dict_to_format.items())]
     content = "\n".join(items_str)
     return f"{spec_name} = {{\n{content}\n}}"
-
-def create_smart_quick_spec(info, spec_type='window', as_dict=False):
-    """Creates an intelligent, minimal, and reliable quick spec."""
-    spec = {}
-    if spec_type == 'window':
-        if info.get('pwa_title'): spec['pwa_title'] = info['pwa_title']
-        if info.get('proc_name'): spec['proc_name'] = info['proc_name']
-        if not spec and info.get('pwa_class_name'): spec['pwa_class_name'] = info['pwa_class_name']
-    elif spec_type == 'element':
-        if info.get('pwa_auto_id'): spec['pwa_auto_id'] = info['pwa_auto_id']
-        elif info.get('pwa_title'):
-            spec['pwa_title'] = info['pwa_title']
-            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
-        elif info.get('pwa_class_name'):
-            spec['pwa_class_name'] = info['pwa_class_name']
-            if info.get('pwa_control_type'): spec['pwa_control_type'] = info['pwa_control_type']
-    
-    if as_dict:
-        return spec
-    return format_spec_to_string(spec, f"{spec_type}_spec")
 
 def clean_element_spec(window_info, element_info):
     """Removes duplicate properties from the element_spec."""
@@ -433,6 +421,22 @@ class ElementFinder:
 
     def _apply_selectors(self, candidates, selectors):
         if not candidates: return []
+        
+        # The 'sort_by_scan_order' is the most direct and efficient selector.
+        # It uses the natural order of the filtered list.
+        if 'sort_by_scan_order' in selectors:
+            index = selectors['sort_by_scan_order']
+            self.log('FILTER', f"Selecting by scan order index: {index}")
+            final_index = index - 1 if index > 0 else index
+            try:
+                selected = candidates[final_index]
+                self.log('SUCCESS', f"Selected candidate by scan order: '{selected.window_text()}'")
+                return [selected]
+            except IndexError:
+                self.log('ERROR', f"Index selection={final_index} is out of range for {len(candidates)} candidates.")
+                return []
+
+        # For other sorting keys, sort the list before selecting.
         sorted_candidates = list(candidates)
         for key in [k for k in selectors if k != 'z_order_index']:
             index = selectors[key]
@@ -440,6 +444,7 @@ class ElementFinder:
             sort_key_func = self._get_sort_key_function(key)
             if sort_key_func:
                 sorted_candidates.sort(key=lambda e: (sort_key_func(e) is None, sort_key_func(e)), reverse=(index < 0))
+        
         final_index = 0
         if 'z_order_index' in selectors:
             final_index = selectors['z_order_index']
@@ -447,10 +452,11 @@ class ElementFinder:
             last_selector_key = list(selectors.keys())[-1]
             final_index = selectors[last_selector_key]
             final_index = final_index - 1 if final_index > 0 else final_index
-        self.log('FILTER', f"Selecting item at index: {final_index}")
+        
+        self.log('FILTER', f"Selecting item at final index: {final_index}")
         try:
             selected = sorted_candidates[final_index]
-            self.log('SUCCESS', f"Selected candidate: '{selected.window_text()}'")
+            self.log('SUCCESS', f"Selected candidate after sorting: '{selected.window_text()}'")
             return [selected]
         except IndexError:
             self.log('ERROR', f"Index selection={final_index} is out of range for {len(sorted_candidates)} candidates.")
