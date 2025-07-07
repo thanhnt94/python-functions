@@ -1,6 +1,7 @@
 # tool_scanner.py
 # A standalone tool for interactive UI element inspection using hotkeys.
-# Refactored to be launchable from the main suite and send specs to the debugger.
+# --- VERSION 2.1: UI Fix. Updated the dialog to be consistent with tool_explorer,
+# showing separate frames for Full and Quick specs.
 
 import logging
 import re
@@ -153,11 +154,9 @@ class InteractiveScannerLogic:
 
 class ScannerApp(tk.Toplevel):
     def __init__(self, suite_app=None):
-        # We need a root window to host this Toplevel, even if it's hidden.
-        # If suite_app is provided, it's the root. Otherwise, create a dummy hidden root.
         root = suite_app if suite_app else tk.Tk()
         if not suite_app:
-            root.withdraw() # Hide the dummy root in standalone mode
+            root.withdraw()
         
         super().__init__(root)
         self.suite_app = suite_app
@@ -171,13 +170,62 @@ class ScannerApp(tk.Toplevel):
         self.highlight_window = None
         self.listener_thread = None
         
-        # To store the latest scanned info
         self.last_window_info = {}
         self.last_element_info = {}
         self.last_cleaned_element_info = {}
+        self.last_quick_win_spec = {}
+        self.last_quick_elem_spec = {}
         
         self.create_spec_dialog_widgets()
         self.run_interactive_scan()
+
+    def _is_static_id(self, auto_id):
+        """Heuristic to check if an Automation ID is static or dynamic."""
+        if not auto_id or not isinstance(auto_id, str):
+            return False
+        if auto_id.isdigit():
+            return False
+        if any(c.isalpha() for c in auto_id):
+            return True
+        return False
+
+    def _build_fixed_quick_spec(self, info, spec_type='window'):
+        """
+        Builds a quick spec based on a fixed priority list of properties.
+        This is used when there is no context of sibling elements.
+        """
+        spec = {}
+        if spec_type == 'window':
+            if info.get('proc_name') and info.get('pwa_title'):
+                spec['proc_name'] = info['proc_name']
+                spec['pwa_title'] = info['pwa_title']
+            elif info.get('pwa_title'):
+                spec['pwa_title'] = info['pwa_title']
+            elif info.get('proc_name'):
+                spec['proc_name'] = info['proc_name']
+            return spec
+
+        elif spec_type == 'element':
+            auto_id = info.get('pwa_auto_id')
+            if auto_id and self._is_static_id(auto_id):
+                spec['pwa_auto_id'] = auto_id
+                return spec
+            
+            if info.get('pwa_title') and info.get('pwa_control_type'):
+                spec['pwa_title'] = info['pwa_title']
+                spec['pwa_control_type'] = info['pwa_control_type']
+                return spec
+            
+            if info.get('pwa_title'):
+                spec['pwa_title'] = info['pwa_title']
+                return spec
+            
+            if info.get('pwa_class_name') and info.get('pwa_control_type'):
+                spec['pwa_class_name'] = info['pwa_class_name']
+                spec['pwa_control_type'] = info['pwa_control_type']
+                return spec
+        
+        return spec
 
     def run_interactive_scan(self):
         self.listener_thread = threading.Thread(target=self.keyboard_listener_thread, daemon=True)
@@ -220,53 +268,35 @@ class ScannerApp(tk.Toplevel):
         main_frame = ttk.Frame(self, padding=10)
         main_frame.pack(fill="both", expand=True)
         main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1); main_frame.rowconfigure(2, weight=1)
+        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1)
 
-        # --- Window Spec Frame ---
-        win_frame = ttk.LabelFrame(main_frame, text="Window Specification", padding=(10, 5))
-        win_frame.grid(row=0, column=0, sticky="nsew", pady=(5, 5))
-        win_frame.columnconfigure(0, weight=1); win_frame.rowconfigure(0, weight=1)
-        self.win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10))
-        self.win_text.grid(row=0, column=0, sticky="nsew")
-        win_btn_frame = ttk.Frame(win_frame)
-        win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        self.copy_full_win_btn = ttk.Button(win_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(self.win_text.get("1.0", "end-1c"), self.copy_full_win_btn))
-        self.copy_full_win_btn.pack(side='left', padx=2)
-        self.copy_quick_win_btn = ttk.Button(win_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_win_spec_str, self.copy_quick_win_btn))
-        self.copy_quick_win_btn.pack(side='left', padx=2)
+        # --- Full Spec Frame ---
+        full_spec_frame = ttk.LabelFrame(main_frame, text="Full Specification (All Properties)", padding=(10, 5))
+        full_spec_frame.grid(row=0, column=0, sticky="nsew", pady=5)
+        full_spec_frame.columnconfigure(0, weight=1); full_spec_frame.rowconfigure(0, weight=1)
+        self.full_text = tk.Text(full_spec_frame, wrap="word", font=("Courier New", 10))
+        self.full_text.grid(row=0, column=0, sticky="nsew")
+        full_btn_frame = ttk.Frame(full_spec_frame)
+        full_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        self.copy_full_btn = ttk.Button(full_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.full_text.get("1.0", "end-1c"), self.copy_full_btn))
+        self.copy_full_btn.pack(side='left', padx=2)
         if self.suite_app:
-            send_win_btn = ttk.Button(win_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, {}))
-            send_win_btn.pack(side='left', padx=2)
-
-        # --- Element Spec Frame ---
-        elem_frame = ttk.LabelFrame(main_frame, text="Element Specification", padding=(10, 5))
-        elem_frame.grid(row=1, column=0, sticky="nsew", pady=5)
-        elem_frame.columnconfigure(0, weight=1); elem_frame.rowconfigure(0, weight=1)
-        self.elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10))
-        self.elem_text.grid(row=0, column=0, sticky="nsew")
-        elem_btn_frame = ttk.Frame(elem_frame)
-        elem_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        self.copy_full_elem_btn = ttk.Button(elem_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(self.elem_text.get("1.0", "end-1c"), self.copy_full_elem_btn))
-        self.copy_full_elem_btn.pack(side='left', padx=2)
-        self.copy_quick_elem_btn = ttk.Button(elem_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_elem_spec_str, self.copy_quick_elem_btn))
-        self.copy_quick_elem_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            send_elem_btn = ttk.Button(elem_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, self.last_cleaned_element_info))
-            send_elem_btn.pack(side='left', padx=2)
-
-        # --- Combined Quick Spec Frame ---
-        quick_frame = ttk.LabelFrame(main_frame, text="Combined Quick Spec", padding=(10, 5))
-        quick_frame.grid(row=2, column=0, sticky="nsew", pady=(5, 0))
+            self.send_full_btn = ttk.Button(full_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, self.last_cleaned_element_info))
+            self.send_full_btn.pack(side='left', padx=2)
+        
+        # --- Quick Spec Frame ---
+        quick_frame = ttk.LabelFrame(main_frame, text="Recommended Quick Spec", padding=(10, 5))
+        quick_frame.grid(row=1, column=0, sticky="nsew", pady=5)
         quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
         self.quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
         self.quick_text.grid(row=0, column=0, sticky="nsew")
         quick_btn_frame = ttk.Frame(quick_frame)
         quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        self.copy_combined_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), self.copy_combined_quick_btn))
-        self.copy_combined_quick_btn.pack(side='left', padx=2)
+        self.copy_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), self.copy_quick_btn))
+        self.copy_quick_btn.pack(side='left', padx=2)
         if self.suite_app:
-            send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(self.quick_win_spec_dict, self.quick_elem_spec_dict))
-            send_quick_btn.pack(side='left', padx=2)
+            self.send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_quick_win_spec, self.last_quick_elem_spec))
+            self.send_quick_btn.pack(side='left', padx=2)
 
     def update_spec_dialog(self, window_info, element_info, cleaned_element_info):
         if not self.winfo_exists(): return
@@ -275,24 +305,22 @@ class ScannerApp(tk.Toplevel):
         self.last_element_info = element_info
         self.last_cleaned_element_info = cleaned_element_info
         
-        self.quick_win_spec_dict = core_logic.create_smart_quick_spec(window_info, 'window', as_dict=True)
-        self.quick_elem_spec_dict = core_logic.create_smart_quick_spec(cleaned_element_info, 'element', as_dict=True)
-        
-        self.quick_win_spec_str = core_logic.format_spec_to_string(self.quick_win_spec_dict, 'window_spec')
-        self.quick_elem_spec_str = core_logic.format_spec_to_string(self.quick_elem_spec_dict, 'element_spec')
-        
+        self.last_quick_win_spec = self._build_fixed_quick_spec(window_info, 'window')
+        self.last_quick_elem_spec = self._build_fixed_quick_spec(cleaned_element_info, 'element')
+
         level = element_info.get('rel_level', 'N/A')
         proc_name = window_info.get('proc_name', 'Unknown')
         self.status_label.config(text=f"Level: {level} | Process: {proc_name}")
 
-        win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
-        self.win_text.config(state="normal"); self.win_text.delete("1.0", "end"); self.win_text.insert("1.0", win_spec_str); self.win_text.config(state="disabled")
+        full_win_str = core_logic.format_spec_to_string(window_info, "window_spec")
+        full_elem_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
+        full_combined_str = f"{full_win_str}\n\n{full_elem_str}"
+        self.full_text.config(state="normal"); self.full_text.delete("1.0", "end"); self.full_text.insert("1.0", full_combined_str); self.full_text.config(state="disabled")
         
-        elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
-        self.elem_text.config(state="normal"); self.elem_text.delete("1.0", "end"); self.elem_text.insert("1.0", elem_spec_str); self.elem_text.config(state="disabled")
-        
-        combined_quick_spec_str = f"{self.quick_win_spec_str}\n\n{self.quick_elem_spec_str}"
-        self.quick_text.config(state="normal"); self.quick_text.delete("1.0", "end"); self.quick_text.insert("1.0", combined_quick_spec_str); self.quick_text.config(state="disabled")
+        quick_win_str = core_logic.format_spec_to_string(self.last_quick_win_spec, "window_spec")
+        quick_elem_str = core_logic.format_spec_to_string(self.last_quick_elem_spec, "element_spec")
+        quick_combined_str = f"{quick_win_str}\n\n{quick_elem_str}"
+        self.quick_text.config(state="normal"); self.quick_text.delete("1.0", "end"); self.quick_text.insert("1.0", quick_combined_str); self.quick_text.config(state="disabled")
         
     def destroy_highlight(self):
         if self.highlight_window and self.highlight_window.winfo_exists():
