@@ -1,6 +1,7 @@
 # tool_explorer.py
 # A standalone and embeddable tool for full window element scanning.
-# Final version with synchronized detail window layout and correct button logic.
+# --- VERSION 7.1 (KeyError Fix): Corrected a critical bug where 'sys_unique_id' was not being
+# added to window properties, causing a crash when building smart specs for duplicate windows.
 
 import logging
 import re
@@ -8,9 +9,9 @@ import time
 import os
 import sys
 import threading
-from pathlib import Path
-import tkinter as tk
 from tkinter import ttk, font, filedialog, messagebox
+import tkinter as tk
+from collections import defaultdict
 
 # --- Required Libraries ---
 try:
@@ -49,21 +50,19 @@ class FullScanner:
     def get_all_windows(self):
         self.logger.info("Starting to scan all windows on the desktop...")
         windows = self.desktop.windows()
-        visible_windows = []
+        all_windows_data = []
         for win in windows:
             try:
                 if win.is_visible() and win.window_text():
-                    info = {
-                        'title': win.window_text(),
-                        'handle': win.handle,
-                        'process': core_logic.get_property_value(win, 'proc_name'),
-                        'pwa_object': win
-                    }
-                    visible_windows.append(info)
+                    info = core_logic.get_all_properties(win, self.uia, self.tree_walker)
+                    info['pwa_object'] = win # Keep the object for later use
+                    # FIX: Added the missing 'sys_unique_id' key to prevent KeyError
+                    info['sys_unique_id'] = id(win.element_info.element)
+                    all_windows_data.append(info)
             except Exception as e:
                 self.logger.warning(f"Could not process window. Error: {e}")
-        self.logger.info(f"Found {len(visible_windows)} valid windows.")
-        return visible_windows
+        self.logger.info(f"Found {len(all_windows_data)} valid windows.")
+        return all_windows_data
 
     def get_all_elements_from_window(self, window_pwa_object):
         if not window_pwa_object:
@@ -84,7 +83,11 @@ class FullScanner:
             element_pwa = UIAWrapper(UIAElementInfo(element_com))
             element_data = core_logic.get_all_properties(element_pwa, self.uia, self.tree_walker)
             if element_data:
+                element_data['sys_unique_id'] = id(element_com)
+                parent_com = self.tree_walker.GetParentElement(element_com)
+                element_data['sys_parent_id'] = id(parent_com) if parent_com else 0
                 all_elements_data.append(element_data)
+
             child = self.tree_walker.GetFirstChildElement(element_com)
             while child:
                 self._walk_element_tree(child, level + 1, all_elements_data, max_depth)
@@ -105,6 +108,7 @@ class ExplorerTab(ttk.Frame):
         
         self.suite_app = suite_app
         self.status_label = status_label_widget or getattr(suite_app, 'status_label', None)
+        self.logger = logging.getLogger(self.__class__.__name__)
 
         style = ttk.Style(self)
         style.theme_use('clam')
@@ -115,44 +119,178 @@ class ExplorerTab(ttk.Frame):
         style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
         
         self.scanner = FullScanner()
-        self.selected_window_object = None
+        self.selected_window_data = None
         self.selected_element_data = None
+        self.window_data_cache = []
         self.element_data_cache = []
         self.window_map = {}
         self.element_map = {}
         self.highlighter_window = None
 
         self.ELEMENT_COLUMNS = {
-            'rel_level': ('Lvl', 50), 'pwa_title': ('Title/Name', 350),
-            'pwa_control_type': ('Control Type', 150), 'pwa_auto_id': ('Automation ID', 150),
-            'pwa_class_name': ('Class Name', 150), 'win32_handle': ('Handle', 100),
-            'state_is_enabled': ('Enabled', 60), 'state_is_visible': ('Visible', 60),
-            'geo_bounding_rect_tuple': ('Rect (L,T,R,B)', 200)
+            'rel_level': ('Lvl', 40), 
+            'pwa_title': ('Title/Name', 450),
+            'pwa_control_type': ('Control Type', 150), 
+            'pwa_auto_id': ('Automation ID', 150),
+            'pwa_class_name': ('Class Name', 150), 
+            'win32_handle': ('Handle', 100),
+            'state_is_enabled': ('Enabled', 60), 
+            'state_is_visible': ('Visible', 60)
         }
         self.create_widgets()
 
-    def create_widgets(self):
+    def _is_static_id(self, auto_id):
+        if not auto_id or not isinstance(auto_id, str):
+            return False
+        if auto_id.isdigit():
+            return False
+        if any(c.isalpha() for c in auto_id):
+            return True
+        return False
+
+    def _build_optimal_element_spec(self, selected_element, all_elements_in_window):
+        self.logger.info("--- Building Optimal Element Spec ---")
+        if not selected_element: return {}
+
+        def get_matches(spec, elements_list):
+            return [elem for elem in elements_list if all(elem.get(k) == v for k, v in spec.items())]
+
+        comparison_list = all_elements_in_window
+        property_combinations = [
+            ['pwa_auto_id'],
+            ['pwa_title', 'pwa_control_type'],
+            ['pwa_title'],
+            ['pwa_class_name', 'pwa_control_type'],
+            ['pwa_class_name'],
+        ]
+        best_effort_spec = {}
+        min_matches_count = len(comparison_list)
+
+        for combo in property_combinations:
+            spec = {}
+            is_combo_valid = True
+            for prop in combo:
+                value = selected_element.get(prop)
+                if value is None or (prop == 'pwa_title' and not value): is_combo_valid = False; break
+                if prop == 'pwa_auto_id' and not self._is_static_id(value): is_combo_valid = False; break
+                spec[prop] = value
+            
+            if is_combo_valid:
+                matches = get_matches(spec, comparison_list)
+                if len(matches) == 1: return spec
+                if len(matches) < min_matches_count:
+                    min_matches_count = len(matches)
+                    best_effort_spec = spec
+        
+        final_matches = get_matches(best_effort_spec, comparison_list)
+        if len(final_matches) > 1:
+            relative_index = next((i for i, match in enumerate(final_matches) if match['sys_unique_id'] == selected_element['sys_unique_id']), -1)
+            if relative_index != -1:
+                best_effort_spec['sort_by_scan_order'] = relative_index + 1
+        
+        return best_effort_spec
+
+    def _build_optimal_window_spec(self, selected_window, all_windows):
+        self.logger.info("--- Building Optimal Window Spec ---")
+        base_spec = {
+            'proc_name': selected_window.get('proc_name'),
+            'pwa_title': selected_window.get('pwa_title')
+        }
+        if not all(base_spec.values()): return {'pwa_title': selected_window.get('pwa_title')}
+
+        matches = [w for w in all_windows if w.get('proc_name') == base_spec.get('proc_name') and w.get('pwa_title') == base_spec.get('pwa_title')]
+        
+        if len(matches) > 1:
+            self.logger.warning(f"Found {len(matches)} duplicate windows. Adding sort_by_scan_order.")
+            relative_index = next((i for i, match in enumerate(matches) if match['sys_unique_id'] == selected_window['sys_unique_id']), -1)
+            if relative_index != -1:
+                base_spec['sort_by_scan_order'] = relative_index + 1
+        
+        return base_spec
+
+    def show_detail_window(self):
+        if not self.selected_element_data:
+            messagebox.showwarning("No Element Selected", "Please select an element from the table below.")
+            return
+        
+        detail_win = tk.Toplevel(self)
+        detail_win.title("Element Specification Details")
+        detail_win.geometry("650x700+50+50")
+        detail_win.transient(self)
+        detail_win.grab_set()
+        
+        window_info = self.selected_window_data
+        element_info = self.selected_element_data
+        cleaned_element_info = core_logic.clean_element_spec(window_info, element_info)
+        
+        optimal_element_spec = self._build_optimal_element_spec(element_info, self.element_data_cache)
+        optimal_window_spec = self._build_optimal_window_spec(window_info, self.window_data_cache)
+
+        def send_specs(win_spec, elem_spec):
+            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
+                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
+                detail_win.destroy()
+
+        main_frame = ttk.Frame(detail_win, padding=10)
+        main_frame.pack(fill="both", expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1)
+        
+        def copy_to_clipboard(content, button):
+            detail_win.clipboard_clear(); detail_win.clipboard_append(content); detail_win.update()
+            original_text = button.cget("text"); button.config(text="✅")
+            detail_win.after(1500, lambda: button.config(text=original_text))
+
+        # --- Full Spec Frame ---
+        full_win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
+        full_elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
+        full_spec_frame = ttk.LabelFrame(main_frame, text="Full Specification (All Properties)", padding=(10, 5))
+        full_spec_frame.grid(row=0, column=0, sticky="nsew", pady=5)
+        full_spec_frame.columnconfigure(0, weight=1); full_spec_frame.rowconfigure(0, weight=1)
+        full_text = tk.Text(full_spec_frame, wrap="word", font=("Courier New", 10))
+        full_text.grid(row=0, column=0, sticky="nsew")
+        full_text.insert("1.0", f"{full_win_spec_str}\n\n{full_elem_spec_str}"); full_text.config(state="disabled")
+        full_btn_frame = ttk.Frame(full_spec_frame)
+        full_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        copy_full_btn = ttk.Button(full_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(full_text.get("1.0", "end-1c"), copy_full_btn))
+        copy_full_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            send_full_btn = ttk.Button(full_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(window_info, cleaned_element_info))
+            send_full_btn.pack(side='left', padx=2)
+        
+        # --- Optimal Spec Frame ---
+        optimal_win_str = core_logic.format_spec_to_string(optimal_window_spec, 'window_spec')
+        optimal_elem_str = core_logic.format_spec_to_string(optimal_element_spec, 'element_spec')
+        combined_optimal_str = f"{optimal_win_str}\n\n{optimal_elem_str}"
+        optimal_frame = ttk.LabelFrame(main_frame, text="Optimal Filter Spec (Recommended)", padding=(10, 5))
+        optimal_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+        optimal_frame.columnconfigure(0, weight=1); optimal_frame.rowconfigure(0, weight=1)
+        optimal_text = tk.Text(optimal_frame, wrap="word", font=("Courier New", 10))
+        optimal_text.grid(row=0, column=0, sticky="nsew")
+        optimal_text.insert("1.0", combined_optimal_str); optimal_text.config(state="disabled")
+        optimal_btn_frame = ttk.Frame(optimal_frame)
+        optimal_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        copy_optimal_btn = ttk.Button(optimal_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(combined_optimal_str, copy_optimal_btn))
+        copy_optimal_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            send_optimal_btn = ttk.Button(optimal_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(optimal_window_spec, optimal_element_spec))
+            send_optimal_btn.pack(side='left', padx=2)
+
+    def create_widgets(self,):
         top_frame = ttk.Frame(self, padding=10)
         top_frame.pack(side='top', fill='x')
-
         self.scan_windows_btn = ttk.Button(top_frame, text="Scan All Windows", command=self.start_scan_windows)
         self.scan_windows_btn.pack(side='left', padx=(0, 10))
-
         self.scan_elements_btn = ttk.Button(top_frame, text="Scan Window's Elements", state="disabled", command=self.start_scan_elements)
         self.scan_elements_btn.pack(side='left', padx=10)
-        
         self.detail_btn = ttk.Button(top_frame, text="View Element Details", state="disabled", command=self.show_detail_window)
         self.detail_btn.pack(side='left', padx=10)
-
         self.export_btn = ttk.Button(top_frame, text="Export to Excel...", state="disabled", command=self.export_to_excel)
         self.export_btn.pack(side='left', padx=10)
-
         main_paned_window = ttk.PanedWindow(self, orient='vertical')
         main_paned_window.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
         windows_frame = self.create_windows_list_frame(main_paned_window)
         main_paned_window.add(windows_frame, weight=1)
-
         elements_frame = self.create_elements_list_frame(main_paned_window)
         main_paned_window.add(elements_frame, weight=2)
 
@@ -177,7 +315,7 @@ class ExplorerTab(ttk.Frame):
         self.elem_tree = ttk.Treeview(frame, columns=column_keys, show="headings")
         for key in column_keys:
             display_name, width = self.ELEMENT_COLUMNS[key]
-            anchor = 'w' if key not in ['rel_level', 'win32_handle', 'state_is_enabled', 'state_is_visible'] else 'center'
+            anchor = 'center' if key in ['rel_level', 'win32_handle', 'state_is_enabled', 'state_is_visible'] else 'w'
             self.elem_tree.heading(key, text=display_name)
             self.elem_tree.column(key, width=width, anchor=anchor)
         self.elem_tree.grid(row=0, column=0, sticky="nsew")
@@ -189,6 +327,27 @@ class ExplorerTab(ttk.Frame):
         self.elem_tree.configure(xscrollcommand=x_scrollbar.set)
         self.elem_tree.bind("<<TreeviewSelect>>", self.on_element_select)
         return frame
+
+    def _scan_elements_thread(self):
+        self.element_data_cache = self.scanner.get_all_elements_from_window(self.selected_window_data['pwa_object'])
+        self.after(0, self.populate_elements_tree, self.element_data_cache)
+
+    def populate_elements_tree(self, elements):
+        self.clear_treeview(self.elem_tree)
+        column_keys = list(self.ELEMENT_COLUMNS.keys())
+        for elem_info in elements:
+            indent = "    " * elem_info.get('rel_level', 0)
+            values = []
+            for key in column_keys:
+                val = elem_info.get(key, '')
+                if key == 'pwa_title': val = indent + str(val)
+                elif isinstance(val, (list, tuple)): val = str(val)
+                values.append(val)
+            item_id = self.elem_tree.insert("", "end", values=tuple(values))
+            self.element_map[item_id] = elem_info
+        self.update_status(f"Explorer: Scan finished! Found {len(elements)} elements.")
+        self.scan_windows_btn.config(state="normal"); self.scan_elements_btn.config(state="normal")
+        if elements: self.export_btn.config(state="normal")
 
     def update_status(self, text):
         if self.status_label:
@@ -203,29 +362,31 @@ class ExplorerTab(ttk.Frame):
         self.export_btn.config(state="disabled"); self.detail_btn.config(state="disabled")
         self.update_status("Explorer: Scanning all windows...")
         self.clear_treeview(self.win_tree); self.clear_treeview(self.elem_tree)
-        self.window_map.clear(); self.element_map.clear()
+        self.window_map.clear(); self.element_map.clear(); self.window_data_cache = []
         threading.Thread(target=self._scan_windows_thread, daemon=True).start()
 
     def _scan_windows_thread(self):
-        windows = self.scanner.get_all_windows()
-        self.after(0, self.populate_windows_tree, windows)
+        windows_data = self.scanner.get_all_windows()
+        self.after(0, self.populate_windows_tree, windows_data)
 
-    def populate_windows_tree(self, windows):
-        for win_info in windows:
-            values = (win_info['title'], win_info['handle'], win_info['process'])
+    def populate_windows_tree(self, windows_data):
+        self.clear_treeview(self.win_tree)
+        self.window_data_cache = windows_data
+        for win_info in windows_data:
+            values = (win_info.get('pwa_title'), win_info.get('handle'), win_info.get('proc_name'))
             item_id = self.win_tree.insert("", "end", values=values)
-            self.window_map[item_id] = win_info['pwa_object']
-        self.update_status(f"Explorer: Found {len(windows)} windows. Please select one to scan for elements.")
+            self.window_map[item_id] = win_info
+        self.update_status(f"Explorer: Found {len(windows_data)} windows. Please select one to scan for elements.")
         self.scan_windows_btn.config(state="normal")
 
     def on_window_select(self, event):
         selected_items = self.win_tree.selection()
         if not selected_items: return
-        self.selected_window_object = self.window_map.get(selected_items[0])
-        if self.selected_window_object:
+        self.selected_window_data = self.window_map.get(selected_items[0])
+        if self.selected_window_data:
             self.scan_elements_btn.config(state="normal")
             self.detail_btn.config(state="disabled")
-            self.update_status(f"Explorer: Selected '{self.selected_window_object.window_text()}'. Ready to scan elements.")
+            self.update_status(f"Explorer: Selected '{self.selected_window_data.get('pwa_title')}'. Ready to scan elements.")
         else:
             self.scan_elements_btn.config(state="disabled")
 
@@ -243,125 +404,27 @@ class ExplorerTab(ttk.Frame):
             self.detail_btn.config(state="disabled")
 
     def start_scan_elements(self):
-        if not self.selected_window_object:
+        if not self.selected_window_data:
             messagebox.showwarning("No Window Selected", "Please select a window from the list first.")
             return
+        
+        window_object = self.selected_window_data.get('pwa_object')
+        if not window_object:
+            messagebox.showerror("Error", "Could not find the window object to scan.")
+            return
+
         self.scan_windows_btn.config(state="disabled"); self.scan_elements_btn.config(state="disabled")
         self.export_btn.config(state="disabled"); self.detail_btn.config(state="disabled")
-        self.update_status(f"Explorer: Scanning elements of '{self.selected_window_object.window_text()}'...")
+        self.update_status(f"Explorer: Scanning elements of '{self.selected_window_data.get('pwa_title')}'...")
         self.clear_treeview(self.elem_tree); self.element_map.clear()
         threading.Thread(target=self._scan_elements_thread, daemon=True).start()
-
-    def _scan_elements_thread(self):
-        self.element_data_cache = self.scanner.get_all_elements_from_window(self.selected_window_object)
-        self.after(0, self.populate_elements_tree, self.element_data_cache)
-
-    def populate_elements_tree(self, elements):
-        column_keys = list(self.ELEMENT_COLUMNS.keys())
-        for elem_info in elements:
-            indent = "    " * elem_info.get('rel_level', 0)
-            values = []
-            for key in column_keys:
-                val = elem_info.get(key, '')
-                if key == 'pwa_title': val = indent + str(val)
-                elif isinstance(val, (list, tuple)): val = str(val)
-                values.append(val)
-            item_id = self.elem_tree.insert("", "end", values=tuple(values))
-            self.element_map[item_id] = elem_info
-        self.update_status(f"Explorer: Scan finished! Found {len(elements)} elements.")
-        self.scan_windows_btn.config(state="normal"); self.scan_elements_btn.config(state="normal")
-        if elements: self.export_btn.config(state="normal")
-
-    def show_detail_window(self):
-        if not self.selected_element_data:
-            messagebox.showwarning("No Element Selected", "Please select an element from the table below.")
-            return
-        detail_win = tk.Toplevel(self)
-        detail_win.title("Element Specification Details")
-        detail_win.geometry("650x700+50+50")
-        detail_win.transient(self)
-        detail_win.grab_set()
-        window_info = core_logic.get_all_properties(self.selected_window_object, self.scanner.uia, self.scanner.tree_walker)
-        element_info = self.selected_element_data
-        
-        def send_specs(win_spec, elem_spec):
-            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
-                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
-                detail_win.destroy()
-
-        main_frame = ttk.Frame(detail_win, padding=10)
-        main_frame.pack(fill="both", expand=True)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1); main_frame.rowconfigure(2, weight=1)
-        
-        cleaned_element_info = core_logic.clean_element_spec(window_info, element_info)
-        def copy_to_clipboard(content, button):
-            detail_win.clipboard_clear(); detail_win.clipboard_append(content); detail_win.update()
-            original_text = button.cget("text"); button.config(text="✅")
-            detail_win.after(1500, lambda: button.config(text=original_text))
-
-        # --- Window Spec Frame ---
-        win_spec_str = core_logic.format_spec_to_string(window_info, "window_spec")
-        quick_win_spec_str = core_logic.create_smart_quick_spec(window_info, 'window')
-        win_frame = ttk.LabelFrame(main_frame, text="Window Specification", padding=(10, 5))
-        win_frame.grid(row=0, column=0, sticky="nsew", pady=5)
-        win_frame.columnconfigure(0, weight=1); win_frame.rowconfigure(0, weight=1)
-        win_text = tk.Text(win_frame, wrap="word", font=("Courier New", 10))
-        win_text.grid(row=0, column=0, sticky="nsew")
-        win_text.insert("1.0", win_spec_str); win_text.config(state="disabled")
-        win_btn_frame = ttk.Frame(win_frame)
-        win_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_full_win_btn = ttk.Button(win_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(win_spec_str, copy_full_win_btn))
-        copy_full_win_btn.pack(side='left', padx=2)
-        copy_quick_win_btn = ttk.Button(win_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_win_spec_str, copy_quick_win_btn))
-        copy_quick_win_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            send_win_btn = ttk.Button(win_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(window_info, {}))
-            send_win_btn.pack(side='left', padx=2)
-        
-        # --- Element Spec Frame ---
-        elem_spec_str = core_logic.format_spec_to_string(cleaned_element_info, "element_spec")
-        quick_elem_spec_str = core_logic.create_smart_quick_spec(cleaned_element_info, 'element')
-        elem_frame = ttk.LabelFrame(main_frame, text="Element Specification (duplicates removed)", padding=(10, 5))
-        elem_frame.grid(row=1, column=0, sticky="nsew", pady=5)
-        elem_frame.columnconfigure(0, weight=1); elem_frame.rowconfigure(0, weight=1)
-        elem_text = tk.Text(elem_frame, wrap="word", font=("Courier New", 10))
-        elem_text.grid(row=0, column=0, sticky="nsew")
-        elem_text.insert("1.0", elem_spec_str); elem_text.config(state="disabled")
-        elem_btn_frame = ttk.Frame(elem_frame)
-        elem_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_full_elem_btn = ttk.Button(elem_btn_frame, text="📋 Full", style="Copy.TButton", command=lambda: copy_to_clipboard(elem_spec_str, copy_full_elem_btn))
-        copy_full_elem_btn.pack(side='left', padx=2)
-        copy_quick_elem_btn = ttk.Button(elem_btn_frame, text="📋 Quick", style="Copy.TButton", command=lambda: copy_to_clipboard(quick_elem_spec_str, copy_quick_elem_btn))
-        copy_quick_elem_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            send_elem_btn = ttk.Button(elem_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(window_info, cleaned_element_info))
-            send_elem_btn.pack(side='left', padx=2)
-        
-        # --- Combined Quick Spec Frame ---
-        quick_win_spec_dict = core_logic.create_smart_quick_spec(window_info, 'window', as_dict=True)
-        quick_elem_spec_dict = core_logic.create_smart_quick_spec(cleaned_element_info, 'element', as_dict=True)
-        combined_quick_spec_str = f"{core_logic.format_spec_to_string(quick_win_spec_dict, 'window_spec')}\n\n{core_logic.format_spec_to_string(quick_elem_spec_dict, 'element_spec')}"
-        quick_frame = ttk.LabelFrame(main_frame, text="Combined Quick Spec", padding=(10, 5))
-        quick_frame.grid(row=2, column=0, sticky="nsew", pady=5)
-        quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
-        quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
-        quick_text.grid(row=0, column=0, sticky="nsew")
-        quick_text.insert("1.0", combined_quick_spec_str); quick_text.config(state="disabled")
-        quick_btn_frame = ttk.Frame(quick_frame)
-        quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        copy_combined_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(combined_quick_spec_str, copy_combined_quick_btn))
-        copy_combined_quick_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send", style="Copy.TButton", command=lambda: send_specs(quick_win_spec_dict, quick_elem_spec_dict))
-            send_quick_btn.pack(side='left', padx=2)
 
     def export_to_excel(self):
         if not self.element_data_cache:
             messagebox.showinfo("No Data", "There is no element data to export.")
             return
-        window_title = self.selected_window_object.window_text()
-        sanitized_title = re.sub(r'[\\/:*?"<>|]', '_', window_title)[:50] or "ScannedWindow"
+        window_title = self.selected_window_data.get('pwa_title', 'ScannedWindow')
+        sanitized_title = re.sub(r'[\\/:*?"<>|]', '_', window_title)[:50]
         initial_filename = f"Elements_{sanitized_title}_{time.strftime('%Y%m%d')}.xlsx"
         file_path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
@@ -403,22 +466,15 @@ class ExplorerTab(ttk.Frame):
             self.highlighter_window.destroy()
         self.highlighter_window = None
 
-# ======================================================================
-#                           ENTRY POINT (for standalone execution)
-# ======================================================================
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
-    
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
     root = tk.Tk()
     root.title("Standalone Window Explorer")
-    root.geometry("1100x700")
-
+    root.geometry("1200x800")
     status_frame = ttk.Frame(root, relief='sunken', padding=2)
     status_frame.pack(side='bottom', fill='x')
     ttk.Label(status_frame, text="© KNT15083").pack(side='right', padx=5)
     status_label = ttk.Label(status_frame, text="Ready (Standalone Mode)")
     status_label.pack(side='left', padx=5)
-    
     app_frame = ExplorerTab(root, status_label_widget=status_label)
-    
     root.mainloop()
