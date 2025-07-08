@@ -1,10 +1,6 @@
 # core_controller.py
 # Refactored Version: Provides the main class for executing UI actions.
-# Key Improvements:
-# 1. Separated find logic into distinct private methods (_find_window, _find_element_in_window).
-# 2. Created a dedicated HumanActivityListener class for better code organization.
-# 3. Actions are now dynamically loaded from core_logic for easier maintenance.
-# 4. Added a new public method 'check_exists' for safely verifying element presence.
+# --- FIX: Corrected a TypeError in get_next_state by passing the missing 'retry_interval' argument.
 
 import logging
 import time
@@ -27,7 +23,6 @@ except ImportError as e:
     sys.exit(1)
 
 # --- Configure logging ---
-# Basic configuration to ensure logs are captured if not already set up.
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(
         level=logging.INFO,
@@ -36,11 +31,9 @@ if not logging.getLogger().hasHandlers():
 
 # --- Import refactored components ---
 try:
-    # Standard import path when used within a package
     from . import core_logic
     from .ui_notifier import StatusNotifier
 except ImportError:
-    # Fallback for standalone execution, useful for testing this module directly.
     try:
         import core_logic
         from ui_notifier import StatusNotifier
@@ -50,17 +43,12 @@ except ImportError:
 
 
 # --- Custom Exception Definitions ---
-# These custom exceptions provide more specific error information.
 class UIActionError(Exception): pass
 class WindowNotFoundError(UIActionError): pass
 class ElementNotFoundFromWindowError(UIActionError): pass
 class AmbiguousElementError(UIActionError): pass
 
 def create_notifier_callback(notifier_instance):
-    """
-    Creates a callback function from a StatusNotifier instance.
-    This allows the controller to send status updates to the UI.
-    """
     if not notifier_instance or not isinstance(notifier_instance, StatusNotifier):
         return None
     def event_handler(event_type, message, **kwargs):
@@ -69,20 +57,15 @@ def create_notifier_callback(notifier_instance):
         )
     return event_handler
 
-# ======================================================================
-#            IMPROVEMENT 3: DEDICATED LISTENER CLASS
-# ======================================================================
 class HumanActivityListener:
     """
     Encapsulates the logic for detecting user input to pause automation.
-    This separates the listening logic from the main controller logic.
     """
     def __init__(self, cooldown_period, bot_acting_lock, is_bot_acting_ref):
         self.logger = logging.getLogger(self.__class__.__name__)
         self._last_human_activity_time = time.time() - cooldown_period
         self._cooldown_period = cooldown_period
         self._bot_acting_lock = bot_acting_lock
-        # Use a mutable type (list) to share the boolean state by reference.
         self._is_bot_acting_ref = is_bot_acting_ref
         
         self._listener_thread = threading.Thread(target=self._run_listeners, daemon=True)
@@ -90,14 +73,11 @@ class HumanActivityListener:
         self.logger.info("Human activity listener started.")
 
     def _update_last_activity(self, *args):
-        """Callback for input listeners to update the activity timestamp."""
         with self._bot_acting_lock:
-            # Only update if the bot is not currently performing an action.
             if not self._is_bot_acting_ref[0]:
                 self._last_human_activity_time = time.time()
 
     def _run_listeners(self):
-        """The target function for the listener thread."""
         try:
             with mouse.Listener(on_move=self._update_last_activity, on_click=self._update_last_activity, on_scroll=self._update_last_activity) as m_listener:
                 with keyboard.Listener(on_press=self._update_last_activity) as k_listener:
@@ -107,7 +87,6 @@ class HumanActivityListener:
             self.logger.error(f"Error in input listener thread: {e}", exc_info=True)
             
     def wait_for_user_idle(self, event_emitter_callback):
-        """Pauses execution if human activity is detected."""
         is_paused = False
         while time.time() - self._last_human_activity_time < self._cooldown_period:
             if not is_paused:
@@ -119,9 +98,6 @@ class HumanActivityListener:
             if event_emitter_callback:
                 event_emitter_callback('success', "User is idle. Resuming automation...", duration=3)
 
-# ======================================================================
-#                      DEFAULT CONFIGURATION
-# ======================================================================
 DEFAULT_CONTROLLER_CONFIG = {
     'backend': 'uia',
     'human_interruption_detection': False,
@@ -131,22 +107,15 @@ DEFAULT_CONTROLLER_CONFIG = {
     'default_retry_interval': 0.5
 }
 
-# ======================================================================
-#                      MAIN CONTROLLER CLASS
-# ======================================================================
 class UIController:
-    # --- Class-level properties for easier management ---
     GETTABLE_PROPERTIES = {'text', 'texts', 'value', 'is_toggled'}.union(core_logic.SUPPORTED_FILTER_KEYS)
     BACKGROUND_SAFE_ACTIONS = {'set_text', 'send_message_text'}
     SENSITIVE_ACTIONS = {'paste_text', 'type_keys', 'set_text'}
-    
-    # IMPROVEMENT 2: Dynamically generate the list of valid actions.
     VALID_ACTIONS = {action['name'] for action in core_logic.ACTION_DEFINITIONS}
 
     def __init__(self, notifier=None, event_callback=None, **kwargs):
         self.logger = logging.getLogger(self.__class__.__name__)
         
-        # Set up the event callback for notifications.
         if event_callback:
             self.event_callback = event_callback
         elif notifier and isinstance(notifier, StatusNotifier):
@@ -154,10 +123,8 @@ class UIController:
         else:
             self.event_callback = None
         
-        # Merge user config with defaults.
         self.config = {**DEFAULT_CONTROLLER_CONFIG, **kwargs}
         
-        # Initialize core automation components.
         self.desktop = Desktop(backend=self.config['backend'])
         try:
             self.uia = comtypes.client.CreateObject(UIA.CUIAutomation)
@@ -166,16 +133,14 @@ class UIController:
             self.logger.critical(f"Fatal error initializing COM: {e}", exc_info=True)
             raise
         
-        # The finder is responsible for all search logic.
         self.finder = core_logic.ElementFinder(
             uia_instance=self.uia,
             tree_walker=self.tree_walker,
             log_callback=self._internal_log
         )
         
-        # --- Human Interruption Handling ---
         self._bot_acting_lock = threading.Lock()
-        self._is_bot_acting = [False] # Use a list to make it mutable for the listener.
+        self._is_bot_acting = [False]
         self.activity_listener = None
         if self.config['human_interruption_detection']:
             self.activity_listener = HumanActivityListener(
@@ -185,11 +150,9 @@ class UIController:
             )
 
     def _internal_log(self, level, message):
-        """Internal log handler for messages from the ElementFinder."""
         self.logger.debug(f"[ElementFinder] {message}")
 
     def _emit_event(self, event_type, message, **kwargs):
-        """Logs events and calls the external callback if available."""
         log_levels = {"info": logging.INFO, "success": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR, "process": logging.DEBUG, "debug": logging.DEBUG}
         self.logger.log(log_levels.get(event_type, logging.INFO), message)
         if self.event_callback and callable(self.event_callback):
@@ -199,36 +162,19 @@ class UIController:
                 self.logger.error(f"Error executing event_callback: {e}")
 
     def _wait_for_user_idle(self):
-        """Delegates the wait task to the activity listener if it exists."""
         if self.activity_listener:
             self.activity_listener.wait_for_user_idle(self._emit_event)
 
     def close(self):
-        """Shuts down the UIController."""
         self.logger.info("Closing UIController...")
-        # Future-proofing: This is where you would stop listener threads if they weren't daemons.
-        # Since they are daemons, they will exit when the main program exits.
 
-    # --- NEW PUBLIC METHOD ---
     def check_exists(self, window_spec, element_spec=None, timeout=None, retry_interval=None):
-        """
-        Checks if a window or element exists without raising an error on failure.
-
-        Args:
-            window_spec (dict): The specification for the window.
-            element_spec (dict, optional): The specification for the element.
-            timeout (int, optional): How long to wait in seconds. Defaults to config.
-
-        Returns:
-            bool: True if the target is found, False otherwise.
-        """
         timeout = timeout if timeout is not None else self.config['default_timeout']
         retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         self._emit_event('info', "Checking for target existence...")
         
         try:
             self._wait_for_user_idle()
-            # Use the internal find method but catch expected exceptions.
             self._find_target_element(window_spec, element_spec, timeout, retry_interval)
             self._emit_event('success', "Target found.")
             return True
@@ -241,17 +187,6 @@ class UIController:
             return False
 
     def get_next_state(self, cases, timeout=None, retry_interval=None, description=None, notify_style='info'):
-        """
-        Waits for one of several UI states to be true.
-
-        Args:
-            cases (dict): A dictionary where keys are state names and values are spec dicts.
-            timeout (int): How long to wait in seconds.
-            description (str): A custom message to log for this action.
-
-        Returns:
-            str: The name of the case that was matched, or None if timed out.
-        """
         timeout = timeout if timeout is not None else self.config['default_timeout']
         retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         display_message = description or f"Waiting for one of {len(cases)} states"
@@ -263,27 +198,29 @@ class UIController:
             for case_name, specs in cases.items():
                 self.logger.debug(f"--- Checking case: '{case_name}' ---")
                 try:
-                    # Use the internal find method with a very short timeout for each check.
-                    self._find_target_element(specs.get('window_spec'), specs.get('element_spec'), timeout=0)
+                    # FIX: Added the missing 'retry_interval' argument. Using 0 as we don't want
+                    # the internal find to wait, the waiting is handled by this method's loop.
+                    self._find_target_element(
+                        specs.get('window_spec'), 
+                        specs.get('element_spec'), 
+                        timeout=0, 
+                        retry_interval=0
+                    )
                     self._emit_event('success', f"Success: '{display_message}' -> State '{case_name}' found")
                     return case_name
                 except (WindowNotFoundError, ElementNotFoundFromWindowError, AmbiguousElementError) as e:
                     self.logger.debug(f"Case '{case_name}' does not match. Reason: {e}")
-                    continue # Try the next case
+                    continue
             time.sleep(retry_interval)
             
         self._emit_event('warning', f"Timeout waiting for: '{display_message}'")
         return None
 
     def run_action(self, window_spec, element_spec=None, action=None, timeout=None, auto_activate=False, retry_interval=None, description=None, notify_style='info'):
-        """
-        Finds a UI element and performs an action on it.
-        """
         timeout = timeout if timeout is not None else self.config['default_timeout']
         retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         
         log_action = action
-        # Secure mode logging
         if self.config['secure_mode'] and action and ':' in action:
             command, _ = action.split(':', 1)
             if command.lower().strip() in self.SENSITIVE_ACTIONS:
@@ -317,9 +254,6 @@ class UIController:
             return False
 
     def get_property(self, window_spec, element_spec=None, property_name=None, timeout=None, retry_interval=None, description=None, notify_style='info'):
-        """
-        Finds a UI element and retrieves a specified property from it.
-        """
         timeout = timeout if timeout is not None else self.config['default_timeout']
         retry_interval = retry_interval if retry_interval is not None else self.config['default_retry_interval']
         display_message = description or f"Getting property '{property_name}'"
@@ -343,9 +277,7 @@ class UIController:
             self._emit_event('error', f"Failed: {display_message}")
             return None
 
-    # --- IMPROVEMENT 1: Refactored private find methods ---
     def _find_window(self, window_spec, timeout, retry_interval):
-        """Internal method to find a single, unambiguous window."""
         start_time = time.time()
         while True:
             windows = self.finder.find(lambda: self.desktop.windows(), window_spec)
@@ -364,7 +296,6 @@ class UIController:
             time.sleep(retry_interval)
     
     def _find_element_in_window(self, window, element_spec, timeout, retry_interval):
-        """Internal method to find a single, unambiguous element within a given window."""
         start_time = time.time()
         while True:
             elements = self.finder.find(lambda: window.descendants(), element_spec)
@@ -383,16 +314,13 @@ class UIController:
             time.sleep(retry_interval)
             
     def _find_target_element(self, window_spec, element_spec, timeout, retry_interval):
-        """Finds the target window and, if specified, the element within it."""
         window = self._find_window(window_spec, timeout, retry_interval)
         if not element_spec:
-            return window # If only a window is needed, return it.
+            return window
         
-        # If an element is needed, use the remaining time to find it.
         return self._find_element_in_window(window, element_spec, timeout, retry_interval)
 
     def _execute_action(self, element, action_str):
-        """Internal method to execute a parsed action string on an element."""
         self.logger.debug(f"Executing action '{action_str}' on element '{element.window_text()}'")
         parts = action_str.split(':', 1)
         command = parts[0].lower().strip()
@@ -423,11 +351,9 @@ class UIController:
                         raise UIActionError("Action 'send_message_text' requires the element to have a window handle.")
                     win32api.SendMessage(element.handle, win32con.WM_SETTEXT, 0, value)
         except Exception as e:
-            # Wrap the original exception for better debugging.
             raise UIActionError(f"Execution of action '{action_str}' failed. Original error: {type(e).__name__} - {e}") from e
         
     def _handle_activation(self, target_element, command, auto_activate):
-        """Ensures the target window is active before performing foreground actions."""
         top_window = core_logic.get_top_level_window(target_element)
         if top_window and not top_window.is_active():
             if auto_activate:
@@ -435,12 +361,11 @@ class UIController:
                 if top_window.is_minimized():
                     top_window.restore()
                 top_window.set_focus()
-                time.sleep(0.5) # Give the window time to respond.
+                time.sleep(0.5)
             else:
                 raise UIActionError(f"Window '{top_window.window_text()}' is not active. Action '{command}' requires activation. Use auto_activate=True to enable it.")
 
     def _execute_action_safely(self, element, action_str):
-        """Wrapper to set a flag indicating the bot is acting, for the input listener."""
         with self._bot_acting_lock:
             self._is_bot_acting[0] = True
         try:
