@@ -1,127 +1,210 @@
-# core_app_manager.py
-# Contains utility functions for process management: launching and closing applications.
-# Renamed from app_manager.py.
+# functions/app_manager.py
+# --- VERSION 2.0: Refactored with an object-oriented approach. ---
+# Introduces the AppManager class for stateful application lifecycle management,
+# while retaining the old functions for simple, stateless operations.
 
 import logging
 import subprocess
-import shlex
-import os
 import time
-import psutil # Required library for working with processes
-from pywinauto import Desktop # Added import to find windows
+import psutil
+import os
 
-# Configure logging for this module
-logger = logging.getLogger(__name__)
-
-def launch_app(command_line, close_existing=False):
-    """
-    Launches an application using a command line.
-
-    Args:
-        command_line (str): The command line to execute.
-        close_existing (bool): If True, closes all old processes
-                               of this application before running a new one.
-    """
-    logger.info(f"Preparing to execute command: {command_line}")
+# --- Import project modules ---
+try:
+    # Standard import path when used within the 'functions' package
+    from .core_controller import UIController
+except ImportError:
+    # Fallback for standalone execution or testing
     try:
-        # Use shlex.split to safely handle commands with spaces and parameters
-        args = shlex.split(command_line)
-        
-        # UPGRADE: Re-add logic to close existing processes
-        if close_existing:
-            # Get the executable name from the command line (e.g., 'notepad.exe')
-            executable_name = os.path.basename(args[0])
-            logger.info(f"Requesting to close old '{executable_name}' processes...")
-            
-            # Call the kill_app function to perform the closing
-            kill_app(process_name=executable_name)
-            
-            # Wait a moment for the OS to handle the process termination
-            time.sleep(1)
-            logger.info("Sent command to close old processes.")
+        from core_controller import UIController
+    except ImportError:
+        print("CRITICAL ERROR: 'core_controller.py' must be in the same directory or package.")
+        # Create a dummy class to prevent crashing if core_controller is not found
+        class UIController:
+            def __init__(self, *args, **kwargs): pass
+            def check_exists(self, *args, **kwargs): return False
+        print("Warning: UIController not found. AppManager will have limited functionality.")
 
-        # Start the new process and do not wait for it to complete
-        subprocess.Popen(args)
-        
-        logger.info("Launch command sent successfully.")
-        
-    except FileNotFoundError:
-        logger.error(f"Error: Executable file not found in command: '{command_line}'")
-    except Exception as e:
-        logger.error(f"Could not launch application: {e}", exc_info=True)
 
-def kill_app(process_name=None, pid=None, pwa_title=None):
+# ======================================================================
+#                      RECOMMENDED: AppManager Class
+# ======================================================================
+
+class AppManager:
     """
-    Forcefully closes one or more processes of an application.
+    Manages the lifecycle of a single application in a stateful way.
+    This is the recommended approach for complex automation scenarios.
+    """
+    def __init__(self, name, command_line, main_window_spec, controller=None):
+        """
+        Initializes an application manager.
+
+        Args:
+            name (str): A user-friendly name for the application (e.g., "Teamcenter").
+            command_line (str): The full command line to execute to launch the app.
+            main_window_spec (dict): The spec for the application's main window,
+                                     used to verify if the app is ready.
+            controller (UIController, optional): An existing UIController instance. 
+                                                 If None, a new one will be created.
+        """
+        self.name = name
+        self.command = command_line
+        self.main_window_spec = main_window_spec
+        self.process = None  # Will store the subprocess.Popen object
+        self.pid = None      # Will store the process ID
+        self.logger = logging.getLogger(f"AppManager({self.name})")
+        
+        # Use the provided controller or create a default one for internal use
+        self.controller = controller if controller else UIController()
+        self.logger.info(f"AppManager for '{self.name}' initialized.")
+
+    def is_running(self):
+        """
+        Checks if the managed application process is currently running.
+        
+        Returns:
+            bool: True if the process is running, False otherwise.
+        """
+        if self.pid and psutil.pid_exists(self.pid):
+            # Verify that the running process has the same name, in case the PID was recycled
+            try:
+                p = psutil.Process(self.pid)
+                # Check if the process name from the command matches the running process
+                # This handles cases where the command is a path like "C:\...\app.exe"
+                expected_exe = os.path.basename(self.command.strip('"').split()[0])
+                if p.name().lower() == expected_exe.lower():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                return False
+        return False
+
+    def launch(self, wait_ready=True, timeout=60):
+        """
+        Launches the application.
+
+        Args:
+            wait_ready (bool, optional): If True, the method will wait until the main
+                                         window of the application appears. Defaults to True.
+            timeout (int, optional): The maximum time in seconds to wait for the main
+                                     window to appear. Defaults to 60.
+
+        Returns:
+            bool: True if the launch was successful (and window appeared, if waited for),
+                  False otherwise.
+        """
+        if self.is_running():
+            self.logger.warning(f"Application '{self.name}' is already running with PID {self.pid}. Not launching again.")
+            return True
+
+        self.logger.info(f"Launching '{self.name}' with command: {self.command}")
+        try:
+            # Use Popen for non-blocking execution
+            self.process = subprocess.Popen(self.command, shell=True)
+            self.pid = self.process.pid
+            self.logger.info(f"'{self.name}' process started with PID: {self.pid}")
+
+            if wait_ready:
+                self.logger.info(f"Waiting for main window to be ready (timeout: {timeout}s)...")
+                if self.controller.check_exists(window_spec=self.main_window_spec, timeout=timeout):
+                    self.logger.info(f"Main window for '{self.name}' found. Launch successful.")
+                    return True
+                else:
+                    self.logger.error(f"Timeout: Main window for '{self.name}' did not appear within {timeout} seconds.")
+                    self.kill() # Clean up the zombie process if the window never appeared
+                    return False
+            
+            return True # Launch successful without waiting
+        except Exception as e:
+            self.logger.error(f"Failed to launch '{self.name}': {e}", exc_info=True)
+            self.process = None
+            self.pid = None
+            return False
+
+    def kill(self):
+        """
+
+        Terminates the managed application process forcefully.
+        """
+        if not self.is_running():
+            self.logger.info(f"Application '{self.name}' is not running. No action needed.")
+            return
+
+        self.logger.warning(f"Attempting to terminate '{self.name}' (PID: {self.pid})...")
+        try:
+            parent = psutil.Process(self.pid)
+            # Terminate all children first, then the parent
+            for child in parent.children(recursive=True):
+                self.logger.debug(f"Terminating child process {child.pid}")
+                child.kill()
+            parent.kill()
+            self.logger.info(f"Successfully terminated '{self.name}' and its children.")
+        except psutil.NoSuchProcess:
+            self.logger.warning(f"Process with PID {self.pid} no longer exists.")
+        except Exception as e:
+            self.logger.error(f"An error occurred while trying to kill '{self.name}': {e}", exc_info=True)
+        finally:
+            self.process = None
+            self.pid = None
+
+
+# ======================================================================
+#                      STATELESS UTILITY FUNCTIONS
+# ======================================================================
+# These are kept for simple, one-off tasks or for backward compatibility.
+
+def launch_app(command_line):
+    """
+    Launches an application in a simple, non-blocking way.
+    Note: This is a stateless function. For better control, use the AppManager class.
+    """
+    logging.info(f"Stateless launch: Executing command '{command_line}'")
+    try:
+        subprocess.Popen(command_line, shell=True)
+        return True
+    except Exception as e:
+        logging.error(f"Stateless launch failed: {e}", exc_info=True)
+        return False
+
+def is_app_running(process_name):
+    """
+    Checks if any process with the given name is running.
+    
+    Args:
+        process_name (str): The name of the process executable (e.g., "notepad.exe").
+
+    Returns:
+        bool: True if at least one process with that name is running.
+    """
+    return any(p.name().lower() == process_name.lower() for p in psutil.process_iter(['name']))
+
+def kill_app(process_name=None, pwa_title=None, pwa_title_icontains=None):
+    """
+    Forcefully terminates all processes matching the given criteria.
+    This is a broad and forceful method. Use with caution.
 
     Args:
-        process_name (str, optional): The name of the process to close (e.g., "notepad.exe").
-        pid (int, optional): The ID of a specific process to close.
-        pwa_title (str, optional): A part or the whole window title.
-                                   Will close all processes with a window matching the title.
+        process_name (str, optional): The name of the process to kill (e.g., "chrome.exe").
+        pwa_title (str, optional): Not used for killing processes, included for legacy reasons.
+        pwa_title_icontains (str, optional): Not used, included for legacy reasons.
     """
-    if not process_name and not pid and not pwa_title:
-        logger.warning("kill_app: Must provide process_name, pid, or pwa_title to close an application.")
+    if not process_name:
+        logging.warning("kill_app called without a process_name. No action taken.")
         return
 
-    try:
-        # Prioritize closing by window title
-        if pwa_title:
-            logger.info(f"Finding and closing windows with title containing: '{pwa_title}'...")
-            pids_to_kill = set()
-            desktop = Desktop(backend='uia')
-            for window in desktop.windows():
-                try:
-                    # Case-insensitive comparison and substring check
-                    if pwa_title.lower() in window.window_text().lower():
-                        pids_to_kill.add(window.process_id())
-                except Exception:
-                    continue
-            
-            if not pids_to_kill:
-                logger.info(f"No window found with a title matching '{pwa_title}'.")
-                return
-
-            logger.info(f"Found {len(pids_to_kill)} processes to close based on title: {pids_to_kill}")
-            for p_id in pids_to_kill:
-                try:
-                    p = psutil.Process(p_id)
-                    p.terminate()
-                except psutil.NoSuchProcess:
-                    continue
-            
-            gone, alive = psutil.wait_procs([psutil.Process(p_id) for p_id in pids_to_kill if psutil.pid_exists(p_id)], timeout=3)
-            for p in alive:
-                logger.warning(f"Could not terminate PID {p.pid} gracefully, attempting to kill...")
+    killed_count = 0
+    for proc in psutil.process_iter(['pid', 'name']):
+        if proc.info['name'].lower() == process_name.lower():
+            try:
+                logging.warning(f"Killing process '{proc.info['name']}' with PID {proc.info['pid']}")
+                p = psutil.Process(proc.info['pid'])
+                for child in p.children(recursive=True):
+                    child.kill()
                 p.kill()
-
-        # Close by process name
-        elif process_name:
-            logger.info(f"Sending command to close all processes named: '{process_name}'...")
-            # Using taskkill is often more robust for closing by name
-            kill_command = f"taskkill /f /im {process_name} > nul 2>&1"
-            result = os.system(kill_command)
-            
-            if result == 0:
-                 logger.info(f"Successfully sent command to close '{process_name}' processes.")
-            else:
-                 logger.info(f"No running process found with the name '{process_name}'.")
-
-        # Close by specific PID
-        elif pid:
-            logger.info(f"Attempting to close process with PID: {pid}...")
-            p = psutil.Process(pid)
-            p.terminate()
-            gone, alive = psutil.wait_procs([p], timeout=3)
-            
-            if gone:
-                logger.info(f"Successfully terminated process PID {pid}.")
-            elif alive:
-                logger.warning(f"Could not terminate PID {pid} gracefully, attempting to kill...")
-                p.kill()
-                logger.info(f"Forcefully killed process PID {pid}.")
-
-    except psutil.NoSuchProcess:
-        logger.error(f"Error: No process found with the provided PID.")
-    except Exception as e:
-        logger.error(f"Error while closing application: {e}", exc_info=True)
+                killed_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                logging.error(f"Failed to kill process {proc.info['pid']}: {e}")
+    
+    if killed_count > 0:
+        logging.info(f"Successfully killed {killed_count} process(es) named '{process_name}'.")
+    else:
+        logging.info(f"No running processes named '{process_name}' were found.")
