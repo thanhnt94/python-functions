@@ -1,14 +1,13 @@
 # tool_scanner.py
 # A standalone tool for interactive UI element inspection using hotkeys.
-# --- VERSION 2.1: UI Fix. Updated the dialog to be consistent with tool_explorer,
-# showing separate frames for Full and Quick specs.
+# --- VERSION 5.6: Corrected the __main__ block to properly launch ScannerApp
+# for standalone execution, fixing the 'not defined' error.
 
 import logging
-import re
-import time
 import os
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, font, messagebox
 from ctypes import wintypes
@@ -23,27 +22,49 @@ try:
     from pywinauto.uia_element_info import UIAElementInfo
     from pywinauto.controls.uiawrapper import UIAWrapper
 except ImportError as e:
-    print(f"Error importing libraries: {e}")
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("Missing Library", f"A required library is not installed.\n\nError: {e}")
     sys.exit(1)
 
 # --- Shared Logic Import ---
 try:
     import core_logic
 except ImportError:
-    print("CRITICAL ERROR: 'core_logic.py' must be in the same directory.")
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("Missing File", "CRITICAL ERROR: 'core_logic.py' must be in the same directory.")
     sys.exit(1)
 
 # ======================================================================
-#                      CONFIGURATION CONSTANTS
+#                       CONFIGURATION CONSTANTS
 # ======================================================================
 
 HIGHLIGHT_DURATION_MS = 2500
-DIALOG_WIDTH = 300 
+DIALOG_WIDTH = 350 
 DIALOG_HEIGHT = 700
 DIALOG_DEFAULT_GEOMETRY = "-10-10" 
 
+ALL_QUICK_SPEC_OPTIONS = [
+    "pwa_title", "pwa_auto_id", "pwa_control_type", "pwa_class_name", "pwa_framework_id",
+    "win32_handle", "win32_styles", "win32_extended_styles", "state_is_visible",
+    "state_is_enabled", "state_is_active", "state_is_minimized", "state_is_maximized",
+    "state_is_focusable", "state_is_password", "state_is_offscreen", "state_is_content_element",
+    "state_is_control_element", "geo_bounding_rect_tuple", "geo_center_point", "proc_pid",
+    "proc_thread_id", "proc_name", "proc_path", "proc_cmdline", "proc_create_time",
+    "proc_username", "rel_level", "rel_parent_handle", "rel_parent_title", "rel_labeled_by",
+    "rel_child_count", "uia_value", "uia_toggle_state", "uia_expand_state",
+    "uia_selection_items", "uia_range_value_info", "uia_grid_cell_info", "uia_table_row_headers"
+]
+DEFAULT_QUICK_SPEC_OPTIONS = [
+    'pwa_auto_id',
+    'pwa_title',
+    'pwa_control_type',
+    'pwa_class_name'
+]
+
 # ======================================================================
-#                      SCANNER LOGIC CLASS
+#                       SCANNER LOGIC CLASS
 # ======================================================================
 
 class InteractiveScannerLogic:
@@ -149,51 +170,155 @@ class InteractiveScannerLogic:
         self.root_gui.update_spec_dialog(window_details, element_details, cleaned_element_details)
 
 # ======================================================================
-#                      GUI CLASS
+#                       GUI CLASS
 # ======================================================================
 
 class ScannerApp(tk.Toplevel):
-    def __init__(self, suite_app=None):
+    def __init__(self, suite_app=None, quick_spec_keys=None):
         root = suite_app if suite_app else tk.Tk()
         if not suite_app:
             root.withdraw()
         
         super().__init__(root)
         self.suite_app = suite_app
+        self.quick_spec_keys = quick_spec_keys
         
-        self.title("Interactive Scan Results")
-        self.geometry(f"{DIALOG_WIDTH}x{DIALOG_HEIGHT}{DIALOG_DEFAULT_GEOMETRY}")
-        self.wm_attributes("-topmost", 1)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
         self.scanner = InteractiveScannerLogic(self)
         self.highlight_window = None
         self.listener_thread = None
         
-        self.last_window_info = {}
-        self.last_element_info = {}
-        self.last_cleaned_element_info = {}
-        self.last_quick_win_spec = {}
-        self.last_quick_elem_spec = {}
+        self.last_window_info, self.last_element_info, self.last_cleaned_element_info = {}, {}, {}
+        self.last_quick_win_spec, self.last_quick_elem_spec = {}, {}
         
-        self.create_spec_dialog_widgets()
+        # Logic to decide which view to show
+        if self.quick_spec_keys:
+            # Launched from suite, go directly to scanner
+            self.title("Interactive Scan Results")
+            self.geometry(f"{DIALOG_WIDTH}x{DIALOG_HEIGHT}{DIALOG_DEFAULT_GEOMETRY}")
+            self.create_scanner_frame()
+            self.scanner_frame.pack(fill="both", expand=True)
+            self.run_interactive_scan()
+        else:
+            # Standalone mode, show config first
+            self.title("Interactive Scanner - Configuration")
+            self.geometry(f"400x500")
+            self.create_config_frame()
+            self.config_frame.pack(fill="both", expand=True)
+
+    def create_config_frame(self):
+        self.config_frame = ttk.Frame(self, padding=20)
+        self.config_vars = {}
+
+        style = ttk.Style(self)
+        style.configure("TLabel", font=('Segoe UI', 10))
+        style.configure("TButton", font=('Segoe UI', 10, 'bold'), padding=5)
+        style.configure("TLabelframe.Label", font=('Segoe UI', 11, 'bold'))
+
+        info_label = ttk.Label(self.config_frame, text="Select properties to include in the 'Quick Spec'.", wraplength=300)
+        info_label.pack(pady=(0, 15), fill='x')
+
+        options_container = ttk.LabelFrame(self.config_frame, text="Element Properties")
+        options_container.pack(fill="both", expand=True, pady=5)
+
+        canvas = tk.Canvas(options_container)
+        scrollbar = ttk.Scrollbar(options_container, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        scrollable_frame.bind("<MouseWheel>", _on_mousewheel)
+
+        for option in ALL_QUICK_SPEC_OPTIONS:
+            is_default = option in DEFAULT_QUICK_SPEC_OPTIONS
+            var = tk.BooleanVar(value=is_default)
+            self.config_vars[option] = var
+            cb = ttk.Checkbutton(scrollable_frame, text=option, variable=var)
+            cb.pack(anchor="w", padx=10, pady=2)
+            cb.bind("<MouseWheel>", _on_mousewheel)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        start_button = ttk.Button(self.config_frame, text="Start Scanning", command=self.start_scanning_mode)
+        start_button.pack(pady=(15, 0))
+
+    def start_scanning_mode(self):
+        selected_keys = [key for key, var in self.config_vars.items() if var.get()]
+        if not selected_keys:
+            messagebox.showwarning("No Selection", "Please select at least one property for the Quick Spec.")
+            return
+        
+        self.quick_spec_keys = selected_keys
+        logging.info(f"Configuration complete. Launching scanner with keys: {self.quick_spec_keys}")
+
+        self.config_frame.destroy() 
+        self.create_scanner_frame() 
+        self.scanner_frame.pack(fill="both", expand=True)
+        self.title("Interactive Scan Results")
+        self.geometry(f"{DIALOG_WIDTH}x{DIALOG_HEIGHT}{DIALOG_DEFAULT_GEOMETRY}")
+        
         self.run_interactive_scan()
 
-    def _is_static_id(self, auto_id):
-        """Heuristic to check if an Automation ID is static or dynamic."""
-        if not auto_id or not isinstance(auto_id, str):
-            return False
-        if auto_id.isdigit():
-            return False
-        if any(c.isalpha() for c in auto_id):
-            return True
-        return False
+    def create_scanner_frame(self):
+        self.scanner_frame = ttk.Frame(self)
+        style = ttk.Style(self)
+        style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
+        
+        status_frame = ttk.Frame(self.scanner_frame, relief='sunken', padding=2)
+        status_frame.pack(side='bottom', fill='x')
+        ttk.Label(status_frame, text="© KNT15083").pack(side='right', padx=5)
+        self.status_label = ttk.Label(status_frame, text="Status: Waiting for scan (F8)...")
+        self.status_label.pack(side='left', padx=5)
 
-    def _build_fixed_quick_spec(self, info, spec_type='window'):
-        """
-        Builds a quick spec based on a fixed priority list of properties.
-        This is used when there is no context of sibling elements.
-        """
+        def copy_to_clipboard(content, button):
+            self.clipboard_clear(); self.clipboard_append(content); self.update()
+            original_text = button.cget("text"); button.config(text="✅")
+            self.after(1500, lambda: button.config(text=original_text))
+        
+        def send_specs(win_spec, elem_spec):
+            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
+                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
+                self.on_closing()
+
+        main_frame = ttk.Frame(self.scanner_frame, padding=10)
+        main_frame.pack(fill="both", expand=True)
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1)
+
+        full_spec_frame = ttk.LabelFrame(main_frame, text="Full Specification (All Properties)", padding=(10, 5))
+        full_spec_frame.grid(row=0, column=0, sticky="nsew", pady=5)
+        full_spec_frame.columnconfigure(0, weight=1); full_spec_frame.rowconfigure(0, weight=1)
+        self.full_text = tk.Text(full_spec_frame, wrap="word", font=("Courier New", 10))
+        self.full_text.grid(row=0, column=0, sticky="nsew")
+        full_btn_frame = ttk.Frame(full_spec_frame)
+        full_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        self.copy_full_btn = ttk.Button(full_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.full_text.get("1.0", "end-1c"), self.copy_full_btn))
+        self.copy_full_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            self.send_full_btn = ttk.Button(full_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, self.last_cleaned_element_info))
+            self.send_full_btn.pack(side='left', padx=2)
+        
+        quick_frame = ttk.LabelFrame(main_frame, text="Recommended Quick Spec", padding=(10, 5))
+        quick_frame.grid(row=1, column=0, sticky="nsew", pady=5)
+        quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
+        self.quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
+        self.quick_text.grid(row=0, column=0, sticky="nsew")
+        quick_btn_frame = ttk.Frame(quick_frame)
+        quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
+        self.copy_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), self.copy_quick_btn))
+        self.copy_quick_btn.pack(side='left', padx=2)
+        if self.suite_app:
+            self.send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_quick_win_spec, self.last_quick_elem_spec))
+            self.send_quick_btn.pack(side='left', padx=2)
+
+    def _build_custom_quick_spec(self, info, spec_type='window'):
         spec = {}
         if spec_type == 'window':
             if info.get('proc_name') and info.get('pwa_title'):
@@ -204,27 +329,11 @@ class ScannerApp(tk.Toplevel):
             elif info.get('proc_name'):
                 spec['proc_name'] = info['proc_name']
             return spec
-
         elif spec_type == 'element':
-            auto_id = info.get('pwa_auto_id')
-            if auto_id and self._is_static_id(auto_id):
-                spec['pwa_auto_id'] = auto_id
-                return spec
-            
-            if info.get('pwa_title') and info.get('pwa_control_type'):
-                spec['pwa_title'] = info['pwa_title']
-                spec['pwa_control_type'] = info['pwa_control_type']
-                return spec
-            
-            if info.get('pwa_title'):
-                spec['pwa_title'] = info['pwa_title']
-                return spec
-            
-            if info.get('pwa_class_name') and info.get('pwa_control_type'):
-                spec['pwa_class_name'] = info['pwa_class_name']
-                spec['pwa_control_type'] = info['pwa_control_type']
-                return spec
-        
+            for key in self.quick_spec_keys:
+                if key in info and info[key] is not None:
+                    spec[key] = info[key]
+            return spec
         return spec
 
     def run_interactive_scan(self):
@@ -241,62 +350,12 @@ class ScannerApp(tk.Toplevel):
 
     def on_closing(self):
         logging.info("Exit command received, shutting down scanner.")
-        keyboard.unhook_all()
+        if self.listener_thread:
+            keyboard.unhook_all()
         self.destroy_highlight()
         self.destroy()
-
-    def create_spec_dialog_widgets(self):
-        style = ttk.Style(self)
-        style.configure("Copy.TButton", padding=2, font=('Segoe UI', 8))
-        
-        status_frame = ttk.Frame(self, relief='sunken', padding=2)
-        status_frame.pack(side='bottom', fill='x')
-        ttk.Label(status_frame, text="© KNT15083").pack(side='right', padx=5)
-        self.status_label = ttk.Label(status_frame, text="Status: Waiting for scan (F8)...")
-        self.status_label.pack(side='left', padx=5)
-
-        def copy_to_clipboard(content, button):
-            self.clipboard_clear(); self.clipboard_append(content); self.update()
-            original_text = button.cget("text"); button.config(text="✅")
-            self.after(1500, lambda: button.config(text=original_text))
-        
-        def send_specs(win_spec, elem_spec):
-            if self.suite_app and hasattr(self.suite_app, 'send_specs_to_debugger'):
-                self.suite_app.send_specs_to_debugger(win_spec, elem_spec)
-                self.on_closing()
-
-        main_frame = ttk.Frame(self, padding=10)
-        main_frame.pack(fill="both", expand=True)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(0, weight=1); main_frame.rowconfigure(1, weight=1)
-
-        # --- Full Spec Frame ---
-        full_spec_frame = ttk.LabelFrame(main_frame, text="Full Specification (All Properties)", padding=(10, 5))
-        full_spec_frame.grid(row=0, column=0, sticky="nsew", pady=5)
-        full_spec_frame.columnconfigure(0, weight=1); full_spec_frame.rowconfigure(0, weight=1)
-        self.full_text = tk.Text(full_spec_frame, wrap="word", font=("Courier New", 10))
-        self.full_text.grid(row=0, column=0, sticky="nsew")
-        full_btn_frame = ttk.Frame(full_spec_frame)
-        full_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        self.copy_full_btn = ttk.Button(full_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.full_text.get("1.0", "end-1c"), self.copy_full_btn))
-        self.copy_full_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            self.send_full_btn = ttk.Button(full_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_window_info, self.last_cleaned_element_info))
-            self.send_full_btn.pack(side='left', padx=2)
-        
-        # --- Quick Spec Frame ---
-        quick_frame = ttk.LabelFrame(main_frame, text="Recommended Quick Spec", padding=(10, 5))
-        quick_frame.grid(row=1, column=0, sticky="nsew", pady=5)
-        quick_frame.columnconfigure(0, weight=1); quick_frame.rowconfigure(0, weight=1)
-        self.quick_text = tk.Text(quick_frame, wrap="word", font=("Courier New", 10))
-        self.quick_text.grid(row=0, column=0, sticky="nsew")
-        quick_btn_frame = ttk.Frame(quick_frame)
-        quick_btn_frame.place(relx=1.0, rely=0, x=-5, y=-11, anchor='ne')
-        self.copy_quick_btn = ttk.Button(quick_btn_frame, text="📋 Copy All", style="Copy.TButton", command=lambda: copy_to_clipboard(self.quick_text.get("1.0", "end-1c"), self.copy_quick_btn))
-        self.copy_quick_btn.pack(side='left', padx=2)
-        if self.suite_app:
-            self.send_quick_btn = ttk.Button(quick_btn_frame, text="🚀 Send to Debugger", style="Copy.TButton", command=lambda: send_specs(self.last_quick_win_spec, self.last_quick_elem_spec))
-            self.send_quick_btn.pack(side='left', padx=2)
+        if not self.suite_app:
+            self.master.quit()
 
     def update_spec_dialog(self, window_info, element_info, cleaned_element_info):
         if not self.winfo_exists(): return
@@ -305,8 +364,8 @@ class ScannerApp(tk.Toplevel):
         self.last_element_info = element_info
         self.last_cleaned_element_info = cleaned_element_info
         
-        self.last_quick_win_spec = self._build_fixed_quick_spec(window_info, 'window')
-        self.last_quick_elem_spec = self._build_fixed_quick_spec(cleaned_element_info, 'element')
+        self.last_quick_win_spec = self._build_custom_quick_spec(window_info, 'window')
+        self.last_quick_elem_spec = self._build_custom_quick_spec(cleaned_element_info, 'element')
 
         level = element_info.get('rel_level', 'N/A')
         proc_name = window_info.get('proc_name', 'Unknown')
@@ -344,11 +403,13 @@ class ScannerApp(tk.Toplevel):
             logging.error(f"Error drawing highlight rectangle: {e}")
 
 # ======================================================================
-#                           ENTRY POINT
+#                       ENTRY POINT
 # ======================================================================
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
     
-    app = ScannerApp(suite_app=None)
+    # This block is for running the scanner as a standalone application.
+    # It should create an instance of ScannerApp, which will handle its own config.
+    app = ScannerApp()
     app.mainloop()
