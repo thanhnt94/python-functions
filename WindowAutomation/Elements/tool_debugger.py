@@ -26,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 # ======================================================================
-#                      DEBUGGER LOGIC CLASS
+#                           DEBUGGER LOGIC CLASS
 # ======================================================================
 class SelectorDebugger:
     def __init__(self, log_callback):
@@ -78,7 +78,7 @@ class SelectorDebugger:
         return core_logic.get_all_properties(pwa_element, self.uia, self.tree_walker)
 
 # ======================================================================
-#                      GUI CLASS (Embeddable Frame)
+#                       GUI CLASS (Embeddable Frame)
 # ======================================================================
 class DebuggerTab(ttk.Frame):
     def __init__(self, parent, suite_app=None, status_label_widget=None):
@@ -226,17 +226,17 @@ class DebuggerTab(ttk.Frame):
         self.found_items_map.clear()
         results = result_bundle.get("results", [])
         search_level = result_bundle.get("level", "element")
+        
         if not results:
             self.update_status("Debugger: Test finished. No items found.")
+            self.results_labelframe.config(text="Found Results")
             return
+
         if len(results) == 1:
-            self.selected_item = results[0]
-            self.selected_item_type = search_level
-            self.highlight_item(self.selected_item)
-            self.get_spec_button.config(state="normal")
             self.update_status(f"Debugger: Test finished. Found 1 unique {search_level}.")
-            return
-        self.update_status(f"Debugger: Found {len(results)} ambiguous {search_level}s. Please select one.")
+        else:
+            self.update_status(f"Debugger: Found {len(results)} ambiguous {search_level}s. Please select one.")
+
         if search_level == 'window':
             self.results_labelframe.config(text="Found Windows")
             self.configure_treeview_columns(['Title', 'Handle', 'Process Name'])
@@ -248,10 +248,38 @@ class DebuggerTab(ttk.Frame):
             self.results_labelframe.config(text="Found Elements")
             self.configure_treeview_columns(['Title/Name', 'Control Type', 'Automation ID'])
             for elem in results:
-                try: values = (elem.window_text()[:100], elem.control_type(), elem.automation_id())
-                except Exception: values = ("[Error getting properties]", "[Error]", "[Error]")
+                # <<< LOGIC MODIFIED HERE >>>
+                # Get each property individually to provide more specific error feedback.
+                try:
+                    title = elem.window_text()[:100] if elem.window_text() else ""
+                except Exception:
+                    title = "[Error: Failed to get text]"
+                
+                try:
+                    ctrl_type = elem.control_type()
+                except Exception:
+                    ctrl_type = "[Error: Failed to get type]"
+
+                try:
+                    auto_id = elem.automation_id()
+                except Exception:
+                    auto_id = "[Error: Failed to get ID]"
+                
+                values = (title, ctrl_type, auto_id)
                 item_id = self.results_tree.insert("", "end", values=values)
                 self.found_items_map[item_id] = (elem, 'element')
+
+        if len(results) == 1:
+            self.after(100, self._auto_select_first_item)
+
+    def _auto_select_first_item(self):
+        """Helper to select the first (and only) item in the results tree."""
+        if not self.results_tree.get_children():
+            return
+        first_item_id = self.results_tree.get_children()[0]
+        self.results_tree.selection_set(first_item_id)
+        self.results_tree.focus(first_item_id)
+        self.on_result_selected(None)
 
     def configure_treeview_columns(self, column_names):
         self.results_tree.config(columns=column_names)
@@ -270,7 +298,11 @@ class DebuggerTab(ttk.Frame):
             self.selected_item, self.selected_item_type = item_data
             self.highlight_item(self.selected_item)
             self.get_spec_button.config(state="normal")
-            self.update_status(f"Debugger: Selected '{self.selected_item.window_text()[:50]}...'")
+            try:
+                self.update_status(f"Debugger: Selected '{self.selected_item.window_text()[:50]}...'")
+            except Exception:
+                self.update_status("Debugger: Selected an item.")
+
 
     def highlight_item(self, item):
         if self.highlighter: self.highlighter.destroy()
@@ -357,11 +389,11 @@ class DebuggerTab(ttk.Frame):
             quick_elem_spec_dict = core_logic.create_smart_quick_spec(cleaned_element_info, 'element', as_dict=True)
 
             send_quick_btn = ttk.Button(action_frame, text="🚀 Send Quick Specs to Debugger", 
-                                        command=lambda: send_specs(quick_win_spec_dict, quick_elem_spec_dict))
+                                            command=lambda: send_specs(quick_win_spec_dict, quick_elem_spec_dict))
             send_quick_btn.grid(row=0, column=0, sticky='w')
 
             send_full_btn = ttk.Button(action_frame, text="🚀 Send Full Specs to Debugger", 
-                                       command=lambda: send_specs(window_info, cleaned_element_info))
+                                           command=lambda: send_specs(window_info, cleaned_element_info))
             send_full_btn.grid(row=0, column=2, sticky='e')
 
     def receive_specs(self, window_spec, element_spec):
@@ -381,7 +413,7 @@ class DebuggerTab(ttk.Frame):
         self.log_message("INFO", "Received specs from another tool.")
 
 # ======================================================================
-#                           ENTRY POINT (for standalone execution)
+#                       ENTRY POINT (for standalone execution)
 # ======================================================================
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', stream=sys.stdout)
