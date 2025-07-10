@@ -14,59 +14,115 @@ import time
 import logging
 
 # ======================================================================
-#                           DEFAULT CONFIGURATION
+#                      DEFAULT CONFIGURATION
 # ======================================================================
 DEFAULT_NOTIFIER_CONFIG = {
-    # General
+    # --- General ---
+    # The transparency of the notification window.
+    # Value: 0.0 (fully transparent) to 1.0 (fully opaque).
     'alpha': 0.95,
+    
+    # The on-screen position of the notification.
+    # Options: 'bottom_right', 'bottom_left', 'top_right', 'top_left', 'center'.
     'position': 'bottom_right',
+    
+    # Horizontal margin (in pixels) from the screen edge.
     'margin_x': 20,
+    
+    # Vertical margin (in pixels) from the screen edge.
     'margin_y': 20,
     
-    # Sizing
+    # --- Sizing ---
+    # The width of the notification window.
+    # Options: 'auto' (calculates automatically) or an integer (e.g., 400).
     'width': 'auto',
+    
+    # The height of the notification window.
+    # Options: 'auto' (calculates automatically) or an integer (e.g., 100).
     'height': 'auto',
+    
+    # Minimum width in pixels. Prevents the window from becoming too narrow.
     'min_width': 300,
+    
+    # Maximum width in pixels. Text will wrap to prevent the window from exceeding this width.
     'max_width': 450,
+    
+    # Minimum height in pixels.
     'min_height': 70,
     
-    # Font & Text
+    # --- Font & Text ---
+    # The name of the font to be used.
+    # Value: A font name installed on the system (e.g., 'Arial', 'Times New Roman').
     'font_family': 'Segoe UI',
-    'font_size': 10,
-    'font_style': 'normal',
-    'font_color': 'auto', # 'auto' uses style color, or specify a hex code
     
-    # Layout & Icons
+    # Font size for the main text content.
+    'font_size': 10,
+    
+    # Style of the font.
+    # Options: 'normal', 'bold', 'italic', 'bold italic'.
+    'font_style': 'normal',
+    
+    # Color of the text.
+    # Options: 'auto' (uses the color defined in 'styles') or a hex color code (e.g., '#FFFFFF').
+    'font_color': 'auto',
+    
+    # --- Layout & Icons ---
+    # Internal horizontal padding (in pixels) within the notification window.
     'padding_x': 20,
+    
+    # Internal vertical padding (in pixels) within the notification window.
     'padding_y': 15,
+    
+    # Space (in pixels) between the icon and the text.
     'icon_text_spacing': 10,
+    
+    # Toggles the visibility of the icon.
+    # Options: True (visible), False (hidden).
     'show_icons': True,
     
-    # Border configuration
+    # --- Border configuration ---
+    # Thickness of the border in pixels. Set to 0 for no border.
     'border_thickness': 1,
+    
+    # Color of the border.
+    # Value: A hex color code (e.g., '#FFFFFF').
     'border_color': '#FFFFFF',
     
-    # Behavior
-    'default_duration': 5,
+    # --- Behavior ---
+    # Default display time in seconds if not specified.
+    # Set to 0 to keep the notification open until user interaction.
+    'default_duration': 10,
+    
+    # Default notification style to use if not specified.
+    # Value must be a key from the 'styles' dictionary below.
     'default_style': 'info',
     
-    # Animation
-    'animation': 'slide-up',
+    # --- Animation ---
+    # Animation type for appearing and disappearing.
+    # Options: 'none', 'fade', 'slide-up', 'slide-down', 'slide-left', 'slide-right', 'grow'.
+    'animation': 'fade',
+    
+    # Speed of the animation in milliseconds per step. A smaller number means a faster animation.
     'animation_speed': 10,
     
-    # Style Definitions
+    # --- Style Definitions ---
+    # Defines different UI themes for notifications.
+    # Each style includes:
+    #   'icon': An emoji or text character for the icon. Leave blank ('') for no icon.
+    #   'fg': Foreground (text) color as a hex code.
+    #   'bg': Background color as a hex code.
     'styles': {
-        'plain':   {'icon': '',     'fg': '#FFFFFF', 'bg': '#34495E'},
-        'info':    {'icon': 'ℹ️', 'fg': '#E1F5FE', 'bg': '#0288D1'},
-        'success': {'icon': '✅', 'fg': '#FFFFFF', 'bg': '#27AE60'},
-        'warning': {'icon': '⚠️', 'fg': '#000000', 'bg': '#F39C12'},
-        'error':   {'icon': '❌', 'fg': '#FFFFFF', 'bg': '#C0392B'},
-        'process': {'icon': '⚙️', 'fg': '#FFFFFF', 'bg': '#7F8C8D'},
-        'question':{'icon': '❓', 'fg': '#FFFFFF', 'bg': '#8E44AD'},
-        'debug':   {'icon': '🐞', 'fg': '#AAB7B8', 'bg': '#17202A'},
-        'download':{'icon': '📥', 'fg': '#FFFFFF', 'bg': '#16A085'},
-        'upload':  {'icon': '📤', 'fg': '#FFFFFF', 'bg': '#16A085'},
-        'auth':    {'icon': '🔑', 'fg': '#FFFFFF', 'bg': '#D35400'},
+        'plain':    {'icon': '',     'fg': '#FFFFFF', 'bg': '#34495E'},
+        'info':     {'icon': 'ℹ️',    'fg': '#E1F5FE', 'bg': '#0288D1'},
+        'success':  {'icon': '✅',    'fg': '#FFFFFF', 'bg': '#27AE60'},
+        'warning':  {'icon': '⚠️',    'fg': '#000000', 'bg': '#F39C12'},
+        'error':    {'icon': '❌',    'fg': '#FFFFFF', 'bg': '#C0392B'},
+        'process':  {'icon': '⚙️',    'fg': '#FFFFFF', 'bg': '#7F8C8D'},
+        'question': {'icon': '❓',    'fg': '#FFFFFF', 'bg': '#8E44AD'},
+        'debug':    {'icon': '🐞',    'fg': '#AAB7B8', 'bg': '#17202A'},
+        'download': {'icon': '📥',    'fg': '#FFFFFF', 'bg': '#16A085'},
+        'upload':   {'icon': '📤',    'fg': '#FFFFFF', 'bg': '##16A085'},
+        'auth':     {'icon': '🔑',    'fg': '#FFFFFF', 'bg': '#D35400'},
     },
 }
 
